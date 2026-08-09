@@ -2,6 +2,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+import streamlit as st
 from streamlit.testing.v1 import AppTest
 
 from streamlit_app import (
@@ -122,6 +123,11 @@ def _clear_caches():
     _transcribe.clear()
     _fetch_youtube_audio.clear()
     _fetch_url_audio.clear()
+    # The wrappers above only reach caches created by the imported module.
+    # AppTest re-executes the script as a separate module with its own
+    # cache_data store, which would otherwise persist for the whole session
+    # and let a fetch-was-skipped assertion pass on a stale cache hit.
+    st.cache_data.clear()
 
 
 @pytest.fixture
@@ -441,6 +447,35 @@ def test_handle_transcription_partial_failure(mock_transcribe, mock_st):
     )
 
 
+@patch("streamlit_app._transcribe")
+def test_handle_transcription_keeps_finished_files_when_interrupted(mock_transcribe, mock_st):
+    # Streamlit aborts a running script by raising RerunException (a BaseException,
+    # so `except Exception` does not catch it) at the next ForwardMsg — which
+    # status.update() is. Results published so far must survive that unwind.
+    class _Interrupt(BaseException):
+        pass
+
+    mock_transcribe.side_effect = [MOCK_WHISPER_RESULT, _Interrupt()]
+    files = [_make_file(f"{stem}.mp3") for stem in ("first", "second")]
+
+    with pytest.raises(_Interrupt):
+        _handle_transcription(files, language=None, task="transcribe", include_subtitles=False)
+
+    transcriptions = mock_st.session_state["transcription"]
+    assert len(transcriptions) == 1
+    assert transcriptions[0]["filename"] == "first.mp3"
+
+
+@patch("streamlit_app._transcribe")
+def test_handle_transcription_clears_previous_batch(mock_transcribe, mock_st):
+    mock_st.session_state["transcription"] = [_make_transcription(filename="stale.mp3")]
+    mock_transcribe.side_effect = RuntimeError("Transcription produced no text")
+
+    _handle_transcription([_make_file()], language=None, task="transcribe", include_subtitles=False)
+
+    assert mock_st.session_state["transcription"] == []
+
+
 # --- _transcription_kwargs ---
 
 
@@ -707,10 +742,13 @@ def test_validate_time_range_invalid(raw):
 APP_PATH = Path(__file__).resolve().parent.parent / "streamlit_app.py"
 
 
-def _run_app(transcription=None):
+def _run_app(transcription=None, active_tab=None):
     at = AppTest.from_file(str(APP_PATH), default_timeout=5)
     if transcription is not None:
         at.session_state["transcription"] = transcription
+    if active_tab is not None:
+        # AppTest has no tab-selection API; st.tabs' `key` holds the active label.
+        at.session_state["input_tabs"] = active_tab
     return at.run()
 
 
@@ -773,37 +811,63 @@ def test_no_results_renders_no_download_button():
 
 
 # The remote-fetch tabs gate their download on `tab.open` because st.tabs
-# computes hidden tab bodies by default. AppTest has no tab-selection API, so
-# these drive the active tab through the `input_tabs` key instead. urlopen is
-# patched on urllib.request (not on streamlit_app) because AppTest re-executes
-# the script each run, rebinding its `from urllib.request import urlopen`.
+# computes hidden tab bodies by default. Network entry points are patched on
+# their own modules (urllib.request / yt_dlp) rather than on streamlit_app,
+# because AppTest re-executes the script each run and rebinds its imports.
+
+UPLOAD_TAB = ":material/upload: Upload"
+YOUTUBE_TAB = ":material/smart_display: YouTube"
+URL_TAB = ":material/link: URL"
 
 
-def _run_app_with_url(url, active_tab):
-    at = AppTest.from_file(str(APP_PATH), default_timeout=5)
-    at.session_state["input_tabs"] = active_tab
-    at.run()
-    next(t for t in at.text_input if t.label == "Audio/video file URL").set_value(url)
+def _type_url(label, url, active_tab):
+    at = _run_app(active_tab=active_tab)
+    next(t for t in at.text_input if t.label == label).set_value(url)
     return at.run()
 
 
-def test_url_fetch_is_skipped_while_another_tab_is_active():
-    with patch("urllib.request.urlopen") as mock_urlopen:
-        _stub_urlopen(mock_urlopen, b"file bytes")
-        at = _run_app_with_url("https://example.com/a.mp3", ":material/upload: Upload")
-    assert not at.exception
-    # The URL is typed and retained, but the tab is hidden, so nothing downloads.
-    assert next(t for t in at.text_input if t.label == "Audio/video file URL").value == (
-        "https://example.com/a.mp3"
-    )
-    mock_urlopen.assert_not_called()
+def _typed_value(at, label):
+    return next(t for t in at.text_input if t.label == label).value
 
 
-def test_url_fetch_runs_when_its_tab_is_active():
+@pytest.mark.parametrize(
+    "active_tab,expected_calls",
+    [(UPLOAD_TAB, 0), (URL_TAB, 1)],
+    ids=["skipped_when_hidden", "fetched_when_active"],
+)
+def test_url_fetch_gated_on_tab_visibility(active_tab, expected_calls):
+    url = "https://example.com/audio.mp3"
     with patch("urllib.request.urlopen") as mock_urlopen:
         _stub_urlopen(mock_urlopen, b"file bytes")
-        at = _run_app_with_url("https://example.com/b.mp3", ":material/link: URL")
+        at = _type_url("Audio/video file URL", url, active_tab)
     assert not at.exception
-    mock_urlopen.assert_called_once()
-    # A resolved remote source enables the Transcribe button.
+    assert mock_urlopen.call_count == expected_calls
+    # The URL is retained either way — only the fetch is gated, not the widget.
+    assert _typed_value(at, "Audio/video file URL") == url
+
+
+@pytest.mark.parametrize(
+    "active_tab,expected_calls",
+    [(UPLOAD_TAB, 0), (YOUTUBE_TAB, 1)],
+    ids=["skipped_when_hidden", "fetched_when_active"],
+)
+def test_youtube_fetch_gated_on_tab_visibility(active_tab, expected_calls, tmp_path):
+    url = "https://youtube.com/watch?v=gated"
+    fake_file = tmp_path / "Clip.m4a"
+    fake_file.write_bytes(b"yt bytes")
+    with patch("yt_dlp.YoutubeDL") as mock_ydl_cls:
+        ydl = MagicMock()
+        ydl.extract_info.return_value = {"title": "Clip"}
+        ydl.prepare_filename.return_value = str(fake_file)
+        mock_ydl_cls.return_value.__enter__.return_value = ydl
+        at = _type_url("YouTube URL", url, active_tab)
+    assert not at.exception
+    assert ydl.extract_info.call_count == expected_calls
+    assert _typed_value(at, "YouTube URL") == url
+
+
+def test_active_remote_tab_enables_transcribe():
+    with patch("urllib.request.urlopen") as mock_urlopen:
+        _stub_urlopen(mock_urlopen, b"file bytes")
+        at = _type_url("Audio/video file URL", "https://example.com/enable.mp3", URL_TAB)
     assert at.button[0].disabled is False

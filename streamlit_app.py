@@ -194,7 +194,13 @@ def _handle_transcription(
     condition_on_previous_text: bool = True,
     clip_timestamps: str = "0",
 ) -> None:
-    transcriptions = []
+    transcriptions: list[dict] = []
+    # Publish up front so a previous batch is cleared even if nothing succeeds
+    # here. Streamlit interrupts a running script at the next ForwardMsg — the
+    # status.update() below is such a point, and RerunException is a
+    # BaseException that `except Exception` will not catch — so assigning only
+    # after the loop would discard every file already transcribed.
+    st.session_state["transcription"] = transcriptions
     total = len(uploaded_files)
     with st.status(f"Transcribing {total} file(s)...", expanded=True) as status:
         for i, uploaded_file in enumerate(uploaded_files, start=1):
@@ -219,6 +225,11 @@ def _handle_transcription(
                         "include_subtitles": include_subtitles,
                     }
                 )
+                # Redundant while session_state holds this exact list (append
+                # mutates it in place), but kept explicit so the progressive
+                # publish does not silently break if `transcriptions` is ever
+                # rebound rather than mutated.
+                st.session_state["transcription"] = transcriptions
             except RuntimeError as e:
                 st.error(f"Transcription failed for {uploaded_file.name}: {e}")
             except Exception as e:
@@ -228,7 +239,6 @@ def _handle_transcription(
             label=f"Transcribed {len(transcriptions)}/{total} file(s)",
             state="complete",
         )
-    st.session_state["transcription"] = transcriptions
 
 
 def _labeled_toggle(label: str, help_text: str) -> bool:
