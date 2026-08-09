@@ -18,7 +18,7 @@ uv run streamlit run streamlit_app.py
 
 When working with Python, invoke the relevant `/astral:<skill>` for uv, ty, and ruff to ensure best practices are followed.
 
-When changing the Streamlit UI (tabs, widgets, theme, layout, caching, fragments), invoke the `developing-with-streamlit` skill to stay version-correct against the pinned `streamlit>=1.58`.
+When changing the Streamlit UI (tabs, widgets, theme, layout, caching, fragments), invoke the `developing-with-streamlit` skill to stay version-correct against the locked Streamlit version (currently 1.61.1; the floor stays `>=1.58`).
 
 ## Automation
 
@@ -35,7 +35,7 @@ When changing the Streamlit UI (tabs, widgets, theme, layout, caching, fragments
 ## Dependencies
 
 - `mlx-whisper` — speech recognition on Apple Silicon
-- `streamlit` — web UI (pinned `>=1.58`, the version developed and tested against)
+- `streamlit` — web UI (floor `>=1.58`, the minimum the app's API usage requires; developed and tested against the locked 1.61.1)
 - `yt-dlp` — YouTube audio download
 - `ffmpeg` — audio/video decoding (system dependency)
 - `ruff` — linting and formatting (dev)
