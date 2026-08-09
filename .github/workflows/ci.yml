@@ -15,9 +15,22 @@ concurrency:
 jobs:
   check:
     name: ruff + ty + pytest
-    # Apple Silicon (arm64) runner — required because mlx-whisper ships no Linux wheels.
+    # Apple Silicon (arm64) runner. Do NOT "simplify" this to ubuntu-latest: the
+    # wheels are not the constraint any more, the backend is. mlx-whisper is a
+    # pure-Python py3-none-any wheel and mlx ships manylinux_2_35 wheels, so
+    # `uv sync --locked` resolves and installs cleanly on Linux — but mlx depends
+    # on its compute backend unconditionally only on Darwin (mlx-metal). On Linux
+    # the backend is opt-in (mlx[cpu] / mlx[cuda]) and uv.lock does not carry that
+    # extra, so a Linux runner goes green through `uv sync` and then dies at
+    # `import mlx_whisper` several steps later.
     runs-on: macos-14
     timeout-minutes: 15
+    # There is no .python-version, so an unpinned run takes uv's newest default
+    # (3.14 today, 3.15 next) while requires-python and [tool.ty.environment] both
+    # say 3.12. Pin the floor so CI exercises the version the README promises and
+    # the one ty is already checking against.
+    env:
+      UV_PYTHON: "3.12"
     steps:
       - uses: actions/checkout@v6
 
@@ -26,9 +39,9 @@ jobs:
         with:
           enable-cache: true
 
-      - name: Install Python
-        run: uv python install
-
+      # No `uv python install` step: `uv sync` provisions the interpreter itself,
+      # and a bare `uv python install` would fetch uv's default version rather
+      # than the UV_PYTHON pinned above.
       - name: Install dependencies (locked)
         run: uv sync --locked
 
