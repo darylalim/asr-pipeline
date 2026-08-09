@@ -72,7 +72,7 @@ Be precise about what `ttl` does, though: Streamlit's `ttl_cache.py` expires **l
 ### Input Modes
 
 - `st.set_page_config(**PAGE_CONFIG)` is the first Streamlit call (before `st.title`); `PAGE_CONFIG` is a module constant (browser tab title `Whisper Transcribe`, a `:material/graphic_eq:` page icon, `centered` layout) so its values stay unit-testable
-- **Upload** / **Record** / **YouTube** / **URL** tabs (`st.tabs`, each label prefixed with a Material Symbol icon — `upload`, `mic`, `smart_display`, `link`) — Upload accepts multiple files (`accept_multiple_files=True`) with one `st.audio` preview per file; the uploader's `type` is `AUDIO_FORMATS + VIDEO_FORMATS`, which Streamlit auto-lists in the dropzone (no hand-maintained duplicate); Record takes a single recording with its own preview; YouTube takes a URL (gated by a `youtube.com` / `youtu.be` regex and stripped of whitespace), downloads the best audio stream via `yt-dlp` (cached — see **Fetch caching** below — plus `restrictfilenames=True`, `noplaylist=True`), and shows an `st.audio` preview of the bytes; URL takes any `http(s)` audio/video file URL (gated by an `https?://` regex; YouTube URLs short-circuit to an `st.info` redirecting to the YouTube tab), downloads via `urllib.request.urlopen` with a 60-second timeout and a 500 MB cap (`MAX_URL_DOWNLOAD_BYTES`, cached), derives the filename from the URL path (percent-decoded, fallback `download`), and shows an `st.audio` preview
+- **Upload** / **Record** / **YouTube** / **URL** tabs (`st.tabs`, each label prefixed with a Material Symbol icon — `upload`, `mic`, `smart_display`, `link`) — Upload accepts multiple files (`accept_multiple_files=True`) with one `st.audio` preview per file; the uploader's `type` is `AUDIO_FORMATS + VIDEO_FORMATS`, which Streamlit lists in the dropzone (no hand-maintained duplicate — but that line truncates, which is why the list is deliberately short; see **Accepted formats**); Record takes a single recording with its own preview; YouTube takes a URL (gated by a `youtube.com` / `youtu.be` regex and stripped of whitespace), downloads the best audio stream via `yt-dlp` (cached — see **Fetch caching** below — plus `restrictfilenames=True`, `noplaylist=True`), and shows an `st.audio` preview of the bytes; URL takes any `http(s)` audio/video file URL (gated by an `https?://` regex; YouTube URLs short-circuit to an `st.info` redirecting to the YouTube tab), downloads via `urllib.request.urlopen` with a 60-second timeout and a 500 MB cap (`MAX_URL_DOWNLOAD_BYTES`, cached), derives the filename from the URL path (percent-decoded, fallback `download`), and shows an `st.audio` preview
 - Below the tabs, controls are grouped by intent (input → output → advanced) for visual hierarchy. Always-visible, in order: **Primary language** selector (input), then the output group — **Translate to English** toggle, **Include subtitles** toggle, **No verbatim** toggle (enables `word_timestamps=True` + `hallucination_silence_threshold=2.0` to skip hallucinations on non-speech audio like music outros). The three power-user controls live in a collapsed **`st.expander("Advanced options", icon=":material/tune:")`** (progressive disclosure — defaults still apply when closed; **do not** add `on_change="rerun"` + `if expander.open:` lazy gating here, see below): **Decode segments independently** toggle (sets `condition_on_previous_text=False` so each 30 s window decodes without prior-window context — robust on noisy audio at the cost of cross-boundary fluency), **Time range** text input (forwarded as `clip_timestamps`; comma-separated `start,end` pairs in seconds, e.g. `30,90` or `0,60,120,180`; blank → `"0"` for the full file; validated by `_validate_time_range` — malformed input disables the Transcribe button until corrected, with the `st.error` rendered outside the Advanced options expander (above the button) so the disabled reason stays visible even when the expander holding the input is collapsed), and **Keyterms** chip input (`st.multiselect` with `accept_new_options=True`, max 50 chips, joined with `, ` and forwarded as `initial_prompt`). Below everything, a right-aligned, full-width (`width="stretch"`) **Transcribe** button with a `:material/graphic_eq:` icon. `Include subtitles` stays in the always-visible output group (never the expander) because it has a user-visible side effect — it flips the download between `.srt` and `.txt`
 - The Transcribe button dispatches in priority order: uploaded files → recording → YouTube audio → URL audio. Each non-upload source is wrapped in a single-element list. YouTube and URL sources share a `_RemoteAudio` adapter exposing `.name` (a safe filename, including extension when available) and `.read()` so they flow through `_handle_transcription` without changes. UI flags are routed through `_transcription_kwargs`, which centralizes the `translate → task` mapping and the `decode_independently → condition_on_previous_text` inversion so a script-level negation can't silently disappear. Subtitles controls both the text area's initial content (SRT-formatted segments when on, plain text when off) and the format the **Download** button serves (`.srt` vs `.txt`); the text area is always editable
 - `_transcribe` writes audio bytes to a temp file, calls `mlx_whisper.transcribe()`, and caches results (`language=None` → Whisper auto-detects)
@@ -92,11 +92,44 @@ Note that `on_change="rerun"` does not itself skip anything: `TabContainer.__ent
 
 Three accepted consequences. Switching tabs now costs a server rerun. `youtube_audio` / `url_audio` are `None` while another tab is active, so a pasted URL alone doesn't enable **Transcribe** unless its tab is showing (upload and record sources stay sticky across tabs, so the button's enabled state is source-dependent). And because a tab switch is now a rerun, it can **interrupt an in-flight transcription** — previously tab switching was purely client-side and could not; this is why `_handle_transcription` publishes results progressively rather than once at the end. `key="input_tabs"` holds the active tab's *label* in session state; `AppTest` has no tab-selection API, so the tests drive tab switches by writing that key.
 
-### Audio Formats
+### Accepted formats
 
-Audio: aac, aiff, ogg, mp3, opus, wav, flac, m4a
+Audio: mp3, m4a, wav, opus
 
-Video: mp4, avi, mkv, mov, wmv, flv, webm, mpeg, 3gpp
+Video: mp4, mov, webm, mkv
+
+**The list is short on purpose, and the order is meaningful.** Both tuples run most-likely-first.
+`ffmpeg` decodes far more than these eight — the tuples are a *product* decision about what the
+uploader advertises and accepts, not a decoder limit.
+
+The forcing constraint is that `st.file_uploader` renders `500MB per file • MP3, M4A, …` inside a
+single span styled `white-space: nowrap; overflow: hidden; text-overflow: ellipsis`
+(`static/js/FileUploader.*.js`), and no `st.file_uploader` parameter reaches that text. Measured
+in a running app at the `centered` layout's max width: the span gets **571px**, the size prefix
+eats **92px**, leaving **~479px** for the format list at Source Sans 14px (~31–40px per entry).
+The former 17-format list needed 546px and truncated mid-word; the current eight need ~265px.
+`test_format_list_fits_the_dropzone_hint` guards this with a 60-character proxy for that budget.
+
+Two rejected alternatives, both worth not re-deriving:
+
+- **An `st.caption` restating the full list below the uploader.** Works, but adds a permanent line
+  of chrome under the dropzone to compensate for a truncated label. Rejected on UI grounds
+- **Shortening `type` to the MIME shortcuts (`type=["audio", "video"]`).** Renders as just
+  `AUDIO/*, VIDEO/*` and always fits — but `enforce_filename_restriction`
+  (`streamlit/elements/lib/file_uploader_utils.py`) **skips server-side validation entirely** when
+  any entry contains a `/`, because the backend can't tell whether a file was meant to match a
+  MIME pattern or an extension. Bare extensions are what keep that bypass guard active
+
+Dropping a format rejects it browser-side *and* server-side, so this is a real narrowing, not a
+label tweak. It applies only to the Upload tab: the YouTube and URL paths never consult these
+tuples, so a `.flac` URL still transcribes fine.
+
+Formats removed when the list was cut to eight, in case one needs restoring: `aac` (near-redundant
+— standalone `.aac` is rare, AAC audio almost always arrives inside `.m4a`), `flac`, `ogg`
+(Telegram voice notes, where WhatsApp uses `.opus`), `aiff`, `avi`, `wmv`, `flv`, `mpeg`, `3gpp`.
+
+If a newline ever seems like the fix for a long format string somewhere: Streamlit's markdown
+pipeline ships no `remark-breaks`, so a single `\n` collapses to a space rather than breaking.
 
 ### Upload Limit
 
@@ -120,6 +153,7 @@ Video: mp4, avi, mkv, mov, wmv, flv, webm, mpeg, 3gpp
 
 Mocked at the boundary (`mlx_whisper`, `yt_dlp`, `urlopen`, `st`). Shared fixtures (`mock_mlx`, `mock_st`, `mock_uploaded_file`) and helpers (`_make_file`, `_stub_urlopen`, `_stub_ytdlp`, `_make_transcription`, `_expected_transcribe_kwargs`, `_handle_transcription_kwargs`, `_ui_state`) factor the common setup; kwarg-forwarding cases are `@pytest.mark.parametrize`d. An autouse `_clear_caches` fixture clears the `@st.cache_data` wrappers before each test so cached results don't leak between cases. It also calls **`st.cache_data.clear()`**, which is not redundant: the per-wrapper `.clear()` calls only reach caches created by the *imported* `streamlit_app` module, while `AppTest` re-executes the script as a separate module with its own cache store that otherwise survives the whole pytest session. Without the global clear, a second test reusing a URL gets a stale hit — which would let a "fetch was skipped" assertion pass even with the gate removed.
 
+- Format constants — `AUDIO_FORMATS` / `VIDEO_FORMATS` pinned exactly (order included, since it decides what survives if the dropzone label is ever cut), plus `test_format_list_fits_the_dropzone_hint`, a 60-character ceiling standing in for the dropzone's ~479px budget (see **Accepted formats**)
 - `_transcribe` — defaults, kwarg forwarding (language, task, initial_prompt, no_verbatim, condition_on_previous_text, clip_timestamps), temp-file cleanup, empty-text guard; `no_verbatim=True` flips `word_timestamps` and `hallucination_silence_threshold`; `clip_timestamps` defaults to `"0"` (full file) and accepts custom ranges (e.g., `"30,90"`)
 - `_handle_transcription` — session-state storage, per-file error handling (RuntimeError + unexpected), kwarg forwarding, multi-file batches, partial-failure scenarios; progressive publishing is pinned by two cases — a `BaseException` raised mid-batch (standing in for `RerunException`) leaves the already-finished files in session state, and a batch where every file fails clears the previous batch's results
 - `_transcription_kwargs` — UI-flag → `_handle_transcription` kwargs mapping; `translate=True` ↔ `task="translate"`, `decode_independently=True` ↔ `condition_on_previous_text=False`; passthrough of `language`, `include_subtitles`, `initial_prompt`, `no_verbatim`, `clip_timestamps`

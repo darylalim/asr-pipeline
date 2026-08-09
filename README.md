@@ -51,7 +51,7 @@ uv sync
 uv run streamlit run streamlit_app.py
 ```
 
-Upload one or more files (audio: `aac, aiff, ogg, mp3, opus, wav, flac, m4a`; video: `mp4, avi, mkv, mov, wmv, flv, webm, mpeg, 3gpp`), record audio in-browser, paste a YouTube URL, or paste an audio/video file URL, then click **Transcribe**.
+Upload one or more files (audio: `mp3, m4a, wav, opus`; video: `mp4, mov, webm, mkv`), record audio in-browser, paste a YouTube URL, or paste an audio/video file URL, then click **Transcribe**.
 
 > **First run:** the first time you transcribe, the Whisper large-v3-turbo weights (~1.5 GB) are downloaded from Hugging Face and cached locally, so the first transcription takes longer and needs an internet connection. Subsequent transcriptions run offline.
 

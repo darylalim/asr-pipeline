@@ -162,29 +162,29 @@ def test_asr_model_repo():
 
 def test_audio_formats():
     assert AUDIO_FORMATS == (
-        "aac",
-        "aiff",
-        "ogg",
         "mp3",
-        "opus",
-        "wav",
-        "flac",
         "m4a",
+        "wav",
+        "opus",
     )
 
 
 def test_video_formats():
     assert VIDEO_FORMATS == (
         "mp4",
-        "avi",
-        "mkv",
         "mov",
-        "wmv",
-        "flv",
         "webm",
-        "mpeg",
-        "3gpp",
+        "mkv",
     )
+
+
+def test_format_list_fits_the_dropzone_hint():
+    # The dropzone renders "<size> per file • MP3, M4A, ..." on a single
+    # `white-space: nowrap; text-overflow: ellipsis` line with ~479px for the
+    # format list at the centered layout's max width. Measured against Source
+    # Sans 14px, each entry costs ~31-40px, so the list has to stay short.
+    hint = ", ".join(f.upper() for f in AUDIO_FORMATS + VIDEO_FORMATS)
+    assert len(hint) <= 60, f"{hint!r} will truncate in the uploader dropzone"
 
 
 # --- _RemoteAudio / _fetch_youtube_audio / _fetch_url_audio ---

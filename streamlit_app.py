@@ -15,26 +15,20 @@ from mlx_whisper.tokenizer import LANGUAGES
 from streamlit.runtime.uploaded_file_manager import UploadedFile
 
 ASR_MODEL_REPO = "mlx-community/whisper-large-v3-turbo"
+# Ordered most-likely-first, and deliberately short: the uploader dropzone lists
+# these on one `text-overflow: ellipsis` line, so a long list truncates mid-word.
+# See "Accepted formats" in CLAUDE.md before adding to either tuple.
 AUDIO_FORMATS = (
-    "aac",
-    "aiff",
-    "ogg",
     "mp3",
-    "opus",
-    "wav",
-    "flac",
     "m4a",
+    "wav",
+    "opus",
 )
 VIDEO_FORMATS = (
     "mp4",
-    "avi",
-    "mkv",
     "mov",
-    "wmv",
-    "flv",
     "webm",
-    "mpeg",
-    "3gpp",
+    "mkv",
 )
 LANGUAGE_CODES: list[str | None] = [None] + sorted(LANGUAGES, key=lambda c: LANGUAGES[c])
 YOUTUBE_URL_RE = re.compile(r"^https?://(www\.|m\.)?(youtube\.com/|youtu\.be/)", re.IGNORECASE)
