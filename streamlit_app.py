@@ -56,7 +56,7 @@ class _RemoteAudio:
         return self._data
 
 
-@st.cache_data(show_spinner="Downloading audio from YouTube...", max_entries=5)
+@st.cache_data(show_spinner="Downloading audio from YouTube...", max_entries=5, ttl="1h")
 def _fetch_youtube_audio(url: str) -> tuple[bytes, str]:
     with tempfile.TemporaryDirectory() as tmpdir:
         ydl_opts = {
@@ -73,7 +73,7 @@ def _fetch_youtube_audio(url: str) -> tuple[bytes, str]:
         return downloaded.read_bytes(), downloaded.name
 
 
-@st.cache_data(show_spinner="Downloading audio from URL...", max_entries=5)
+@st.cache_data(show_spinner="Downloading audio from URL...", max_entries=5, ttl="1h")
 def _fetch_url_audio(url: str) -> tuple[bytes, str]:
     with urlopen(url, timeout=60) as resp:
         data = resp.read(MAX_URL_DOWNLOAD_BYTES + 1)
@@ -231,18 +231,18 @@ def _handle_transcription(
     st.session_state["transcription"] = transcriptions
 
 
-def _labeled_toggle(label: str, help: str) -> bool:
+def _labeled_toggle(label: str, help_text: str) -> bool:
     label_col, input_col = st.columns([3, 1], vertical_alignment="center")
     with label_col:
-        st.markdown(label, help=help)
+        st.markdown(label, help=help_text)
     with input_col, st.container(horizontal_alignment="right"):
         return st.toggle(label, value=False, label_visibility="collapsed")
 
 
-def _field_label(label: str, help: str) -> None:
+def _field_label(label: str, help_text: str) -> None:
     label_col, _ = st.columns([3, 1], vertical_alignment="center")
     with label_col:
-        st.markdown(label, help=help)
+        st.markdown(label, help=help_text)
 
 
 def _transcription_kwargs(
@@ -307,11 +307,16 @@ upload_tab, record_tab, youtube_tab, url_tab = st.tabs(
         ":material/mic: Record",
         ":material/smart_display: YouTube",
         ":material/link: URL",
-    ]
+    ],
+    # on_change="rerun" enables the per-tab `.open` flag used to gate the remote
+    # fetches below; `key` exposes the active tab's label in session state so
+    # AppTest can drive tab switches (it has no tab-selection API of its own).
+    on_change="rerun",
+    key="input_tabs",
 )
 with upload_tab:
     uploaded_files = st.file_uploader(
-        "Upload audio file",
+        "Upload audio or video files",
         type=AUDIO_FORMATS + VIDEO_FORMATS,
         label_visibility="collapsed",
         accept_multiple_files=True,
@@ -331,7 +336,12 @@ with youtube_tab:
         label_visibility="collapsed",
     ).strip()
     youtube_audio: _RemoteAudio | None = None
-    if youtube_url and YOUTUBE_URL_RE.match(youtube_url):
+    # Gate the fetch — not the text input — on tab visibility. st.tabs computes
+    # hidden bodies by default, so an ungated fetch downloads while the user is on
+    # another tab, and the Transcribe dispatch prioritizes uploads anyway. The
+    # input stays outside the guard because Streamlit drops state for widgets it
+    # doesn't render, which would clear the typed URL on every tab switch.
+    if youtube_tab.open and youtube_url and YOUTUBE_URL_RE.match(youtube_url):
         try:
             data, filename = _fetch_youtube_audio(youtube_url)
             youtube_audio = _RemoteAudio(filename, data)
@@ -349,7 +359,8 @@ with url_tab:
         label_visibility="collapsed",
     ).strip()
     url_audio: _RemoteAudio | None = None
-    if file_url and URL_RE.match(file_url):
+    # Fetch gated on tab visibility for the same reason as the YouTube tab above.
+    if url_tab.open and file_url and URL_RE.match(file_url):
         if YOUTUBE_URL_RE.match(file_url):
             st.info("This looks like a YouTube URL — use the YouTube tab.")
         else:

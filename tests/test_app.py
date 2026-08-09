@@ -770,3 +770,40 @@ def test_results_render_download_button_with_icon():
 
 def test_no_results_renders_no_download_button():
     assert _run_app().get("download_button") == []
+
+
+# The remote-fetch tabs gate their download on `tab.open` because st.tabs
+# computes hidden tab bodies by default. AppTest has no tab-selection API, so
+# these drive the active tab through the `input_tabs` key instead. urlopen is
+# patched on urllib.request (not on streamlit_app) because AppTest re-executes
+# the script each run, rebinding its `from urllib.request import urlopen`.
+
+
+def _run_app_with_url(url, active_tab):
+    at = AppTest.from_file(str(APP_PATH), default_timeout=5)
+    at.session_state["input_tabs"] = active_tab
+    at.run()
+    next(t for t in at.text_input if t.label == "Audio/video file URL").set_value(url)
+    return at.run()
+
+
+def test_url_fetch_is_skipped_while_another_tab_is_active():
+    with patch("urllib.request.urlopen") as mock_urlopen:
+        _stub_urlopen(mock_urlopen, b"file bytes")
+        at = _run_app_with_url("https://example.com/a.mp3", ":material/upload: Upload")
+    assert not at.exception
+    # The URL is typed and retained, but the tab is hidden, so nothing downloads.
+    assert next(t for t in at.text_input if t.label == "Audio/video file URL").value == (
+        "https://example.com/a.mp3"
+    )
+    mock_urlopen.assert_not_called()
+
+
+def test_url_fetch_runs_when_its_tab_is_active():
+    with patch("urllib.request.urlopen") as mock_urlopen:
+        _stub_urlopen(mock_urlopen, b"file bytes")
+        at = _run_app_with_url("https://example.com/b.mp3", ":material/link: URL")
+    assert not at.exception
+    mock_urlopen.assert_called_once()
+    # A resolved remote source enables the Transcribe button.
+    assert at.button[0].disabled is False
