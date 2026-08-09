@@ -76,9 +76,10 @@ Video: mp4, avi, mkv, mov, wmv, flv, webm, mpeg, 3gpp
 
 ### Theme
 
-- Defined in `.streamlit/config.toml`: an indigo (`#6366f1`) accent on a neutral zinc palette, Inter (body/headings) + JetBrains Mono (code) via Google Fonts, `8px` radius, no link underline
-- Both `[theme.light]` and `[theme.dark]` are defined (with shared font/radius options in `[theme]`), so the light/dark switcher stays available in the app settings menu — a single-mode `[theme]` would lock the app to one mode
-- Native theming only (no custom CSS/HTML); font changes require a server restart
+- Streamlit's built-in light and dark themes — `.streamlit/config.toml` carries **no `[theme]` section at all**, so the app inherits the stock palette and typography
+- Deliberately unconfigured rather than re-specified: every `theme.*` option defaults to `None` (the stock look lives in the frontend, not in config defaults), so writing out the default hex values would pin the app to one Streamlit version's styling instead of tracking upstream restyles
+- The light/dark switcher in the app settings menu stays available. The "single-mode `[theme]` locks the app to one mode" hazard applies only to *custom* themes; with no theme configured, Light / Dark / system setting are all offered
+- Native theming only (no custom CSS/HTML). If a custom theme is reintroduced, define both `[theme.light]` and `[theme.dark]` to keep the switcher, and note that font changes require a server restart
 
 ### Error Handling
 
