@@ -41,6 +41,12 @@ When changing the Streamlit UI (tabs, widgets, theme, layout, caching, fragments
 - `ruff` — linting and formatting (dev)
 - `ty` — type checking (dev)
 - `pytest` — testing (dev)
+- `watchdog` — event-based file watching for Streamlit's auto-reload (dev). Streamlit already
+  depends on it, but declares the requirement as `platform_system != "Darwin"` — so on Apple
+  Silicon it is *not* installed transitively, and `streamlit run` falls back to
+  `PollingPathWatcher` (the source of the "For better performance, install the Watchdog module"
+  notice). Declaring it here restores the `FSEventsObserver` backend. Dev-only because it affects
+  the edit-reload loop, not transcription; the app is fully functional without it
 
 ## Architecture
 
