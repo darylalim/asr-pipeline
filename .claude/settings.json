@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "f=$(jq -r '.tool_input.file_path // empty'); cd \"$CLAUDE_PROJECT_DIR\" 2>/dev/null || exit 0; case \"$f\" in *.py) uv run ruff format \"$f\" && uv run ruff check --fix \"$f\";; *.md) uv run ruff format \"$f\";; esac > /dev/null 2>&1 || true",
+            "command": "f=$(jq -r '.tool_input.file_path // empty'); cd \"$CLAUDE_PROJECT_DIR\" 2>/dev/null || exit 0; case \"$f\" in \"$PWD\"/*) ;; *) exit 0;; esac; case \"$f\" in *.py) uv run ruff format \"$f\" && uv run ruff check --fix \"$f\";; *.md) uv run ruff format \"$f\";; esac > /dev/null 2>&1 || true",
             "timeout": 60,
             "statusMessage": "ruff format + lint"
           }
@@ -18,9 +18,9 @@
         "hooks": [
           {
             "type": "command",
-            "command": "input=$(cat); [ \"$(printf '%s' \"$input\" | jq -r '.stop_hook_active // false')\" = true ] && exit 0; cd \"$CLAUDE_PROJECT_DIR\" || exit 0; out=$(uv run ruff check -q . 2>&1 && uv run ruff format --check -q . 2>&1 && uv run ty check 2>&1 && uv run pytest -q 2>&1) || printf '%s' \"$out\" | jq -Rs '{decision:\"block\",reason:(\"local checks failed - fix before finishing:\\n\"+.)}'",
+            "command": "input=$(cat); [ \"$(printf '%s' \"$input\" | jq -r '.stop_hook_active // false')\" = true ] && exit 0; cd \"${CLAUDE_PROJECT_DIR:-.}\" || exit 0; out=$(uv lock --check 2>&1 && uv run ruff check -q . 2>&1 && uv run ruff format --check -q . 2>&1 && uv run ty check 2>&1 && uv run pytest -q 2>&1) || printf '%s' \"$out\" | jq -Rs '{decision:\"block\",reason:(\"local checks failed - fix before finishing:\\n\"+.)}'",
             "timeout": 120,
-            "statusMessage": "ruff + ty + pytest"
+            "statusMessage": "uv lock + ruff + ty + pytest"
           }
         ]
       }
