@@ -1,0 +1,19 @@
+version: 2
+
+updates:
+  # Keeps the SHA pins in .github/workflows current. Dependabot rewrites the
+  # commit SHA and its trailing `# vX.Y.Z` comment together, which is what makes
+  # SHA pinning maintainable — without this the pins go stale silently, since a
+  # frozen SHA never surfaces the security fix it is missing.
+  - package-ecosystem: github-actions
+    # Must be "/" for this ecosystem; Dependabot scans .github/workflows itself.
+    directory: /
+    schedule:
+      interval: weekly
+    # One PR per week for all action bumps rather than one PR per action.
+    groups:
+      actions:
+        patterns: ["*"]
+    # Match the repo's conventional-commit style: "ci: bump the actions group".
+    commit-message:
+      prefix: ci
