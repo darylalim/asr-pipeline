@@ -21,12 +21,13 @@ jobs:
   draft-release:
     name: Draft release on version bump
     # Plain ubuntu (unlike CI's macos-14): this job only reads the version string
-    # and calls the GitHub API — it never runs `uv sync`, so the absent
-    # mlx-whisper Linux wheels are irrelevant here.
+    # and calls the GitHub API — it never runs `uv sync`, so the Darwin-only mlx
+    # backend never has to install.
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v6
+      # SHA-pinned, matching ci.yml — see the note there.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Read version from pyproject.toml
         id: version

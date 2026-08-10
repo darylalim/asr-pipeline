@@ -14,45 +14,27 @@ concurrency:
 
 jobs:
   check:
-    name: ruff + ty + pytest
-    # Apple Silicon (arm64) runner. Do NOT "simplify" this to ubuntu-latest: the
-    # wheels are not the constraint any more, the backend is. mlx-whisper is a
-    # pure-Python py3-none-any wheel and mlx ships manylinux_2_35 wheels, so
-    # `uv sync --locked` resolves and installs cleanly on Linux — but mlx depends
-    # on its compute backend unconditionally only on Darwin (mlx-metal). On Linux
-    # the backend is opt-in (mlx[cpu] / mlx[cuda]) and uv.lock does not carry that
-    # extra, so a Linux runner goes green through `uv sync` and then dies at
-    # `import mlx_whisper` several steps later.
+    # Apple Silicon. Do NOT switch to ubuntu-latest: mlx pulls its compute
+    # backend unconditionally only on Darwin, so Linux resolves and installs
+    # cleanly, then dies at `import mlx_whisper`. See CLAUDE.md.
     runs-on: macos-14
     timeout-minutes: 15
     # There is no .python-version, so an unpinned run takes uv's newest default
-    # (3.14 today, 3.15 next) while requires-python and [tool.ty.environment] both
-    # say 3.12. Pin the floor so CI exercises the version the README promises and
-    # the one ty is already checking against.
+    # while requires-python and [tool.ty.environment] both say 3.12.
     env:
       UV_PYTHON: "3.12"
     steps:
-      - uses: actions/checkout@v6
+      # Every action is pinned to a full commit SHA — a tag is mutable, so a
+      # compromised or force-moved tag would run arbitrary code with this
+      # workflow's token. Keep the trailing version comment in sync on bumps.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
-          enable-cache: true
+          enable-cache: true # mlx-whisper pulls torch (504 MB); a cold cache dominates the run
 
-      # No `uv python install` step: `uv sync` provisions the interpreter itself,
-      # and a bare `uv python install` would fetch uv's default version rather
-      # than the UV_PYTHON pinned above.
-      - name: Install dependencies (locked)
-        run: uv sync --locked
-
-      - name: Lint
-        run: uv run ruff check .
-
-      - name: Format check
-        run: uv run ruff format --check .
-
-      - name: Type check
-        run: uv run ty check
-
-      - name: Tests
-        run: uv run pytest -q
+      - run: uv sync --locked
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run ty check
+      - run: uv run pytest -q
