@@ -10,7 +10,9 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # PR runs are disposable, main runs are not: a main run can be mid-publish in
+  # the release job below, between creating the draft and flipping it live.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   check:
@@ -25,8 +27,8 @@ jobs:
       UV_PYTHON: "3.12"
     steps:
       # Every action is pinned to a full commit SHA — a tag is mutable, so a
-      # compromised or force-moved tag would run arbitrary code with this
-      # workflow's token. Keep the trailing version comment in sync on bumps.
+      # compromised or force-moved tag would run arbitrary code with the token
+      # below. Dependabot keeps the pins current; see .github/dependabot.yml.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
@@ -38,3 +40,65 @@ jobs:
       - run: uv run ruff format --check .
       - run: uv run ty check
       - run: uv run pytest -q
+
+  # Bumping project.version in pyproject.toml IS the release action: this job
+  # tags the commit and publishes v<version>, but only once `check` is green.
+  # It runs on every push to main and no-ops when the release already exists,
+  # so the guard is the release itself rather than a `paths:` filter — a filter
+  # misses a bump that arrives inside a merge commit, and cannot be re-run.
+  release:
+    needs: check
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Plain ubuntu, unlike check: this job only reads a version string and calls
+    # the GitHub API, so the Darwin-only mlx backend never has to install.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Job-level scope replaces the workflow default above, so write access is
+    # confined to this job — it is the only thing in the repo that needs it.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - id: version
+        run: |
+          version=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          if [ -z "$version" ]; then
+            echo "::error::Could not read project.version from pyproject.toml"
+            exit 1
+          fi
+          echo "tag=v${version}" >> "$GITHUB_OUTPUT"
+
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          state=$(gh release view "$TAG" --json isDraft \
+            --jq 'if .isDraft then "draft" else "published" end' 2>/dev/null || echo missing)
+          case "$state" in
+            published)
+              echo "$TAG is already released — nothing to do."
+              exit 0
+              ;;
+            draft)
+              # A previous run died between the two calls below. Finish it
+              # instead of skipping, which would strand the draft forever.
+              echo "Resuming an existing draft for $TAG."
+              ;;
+            missing)
+              gh release create "$TAG" --draft --title "$TAG" \
+                --target "$GITHUB_SHA" --generate-notes
+              echo "Drafted $TAG at $GITHUB_SHA."
+              ;;
+            *)
+              # Unreachable via the jq expression above, so getting here means
+              # gh returned something unexpected. Fail rather than fall through
+              # to a publish of a release whose state is unknown.
+              echo "::error::Unexpected release state for $TAG: '$state'"
+              exit 1
+              ;;
+          esac
+          # Publishing is what creates the git tag — GitHub withholds it while
+          # the release is a draft, so the tag never outlives a failed publish.
+          gh release edit "$TAG" --draft=false --latest
+          echo "Published $TAG."
