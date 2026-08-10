@@ -78,7 +78,7 @@ uv run ruff format .      # format
 uv run ty check           # type-check
 ```
 
-CI runs the same tools on every push to `main` and on pull requests — it uses `ruff format --check .` to *verify* formatting rather than apply it, so run `ruff format .` locally before committing. The workflow targets a **macos-14 (Apple Silicon) runner**, since `mlx-whisper` ships no Linux wheels. Please make sure `ruff`, `ty`, and `pytest` pass before opening a pull request.
+CI runs the same tools on every push to `main` and on pull requests — it uses `ruff format --check .` to *verify* formatting rather than apply it, so run `ruff format .` locally before committing. The workflow targets a **macos-14 (Apple Silicon) runner** because of the compute backend, not wheel availability: `mlx` pulls in a backend automatically only on macOS (`mlx-metal`), whereas on Linux it is an opt-in extra — so a Linux runner installs cleanly and then fails at `import mlx_whisper`. Please make sure `ruff`, `ty`, and `pytest` pass before opening a pull request.
 
 ## Troubleshooting
 
