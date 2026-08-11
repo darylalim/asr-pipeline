@@ -134,7 +134,7 @@ def _format_srt(result: dict) -> str:
     )
 
 
-_MARKDOWN_ESCAPE_RE = re.compile(r"([\\`*_~\[\]:$])")
+_MARKDOWN_ESCAPE_RE = re.compile(r"([\\`*_~\[\]:$&])")
 
 
 def _escape_markdown(text: str) -> str:
@@ -144,6 +144,18 @@ def _escape_markdown(text: str) -> str:
     backticks, brackets, or : (emoji/Material-icon directives) — common in YouTube
     titles and underscored names — would otherwise mis-render. Escaping keeps the
     displayed name literal.
+
+    `&` is in the class because micromark's characterReference construct is a
+    parse-time one: without it `clip&#58;streamlit&#58;.mp3` decodes to a live
+    `:streamlit:` that the frontend's post-parse pass then swaps for the logo
+    image, and `Rock &amp; Roll.mp3` displays as `Rock & Roll.mp3`. `&` is ASCII
+    punctuation, so `\\&` is a valid CommonMark characterEscape.
+
+    This handles inline constructs only. Block markers (#, >, -, +, |) are left
+    live, and are neutralized instead by collapsing whitespace at the call site —
+    every block construct needs a line start, so removing newlines removes all of
+    them at once. That matters only for st.error, whose body is the one sink
+    rendered without the frontend's isLabel guard.
     """
     return _MARKDOWN_ESCAPE_RE.sub(r"\\\1", text)
 
@@ -244,8 +256,14 @@ def _handle_transcription(
             # filename carrying `![](https://host/x.png)` would fetch on *every*
             # file, not just a failure — and st.error below renders full Markdown.
             # Filenames are not trusted input: _fetch_url_audio percent-decodes
-            # them off the URL path, so `%5B`/`%28` arrive as live syntax.
-            name_md = _escape_markdown(uploaded_file.name)
+            # them off the URL path, so `%5B`/`%28` arrive as live syntax — and
+            # `%0A` arrives as a real newline. Collapsing whitespace is what
+            # handles that half: st.error's *body* renders without the frontend's
+            # isLabel flag, which is what auto-escapes `#`/`>`/`-`/`+` and strips
+            # block elements at every other sink, so a newline here would open a
+            # heading or blockquote inside the error box. Every block construct
+            # needs a line start, so removing newlines closes all of them at once.
+            name_md = _escape_markdown(" ".join(uploaded_file.name.split()))
             status.update(label=f"Transcribing {name_md} ({i}/{total})...")
             name = Path(uploaded_file.name)
             try:

@@ -465,6 +465,25 @@ def test_handle_transcription_escapes_filename_in_status_label(mock_transcribe, 
     status.update.assert_any_call(label=r"Transcribing clip \[1\].mp3 (1/1)...")
 
 
+def test_handle_transcription_collapses_whitespace_in_filename(mock_st):
+    # _fetch_url_audio percent-decodes off the URL path, so `%0A` arrives as a real
+    # newline. st.error's body is the one sink rendered without the frontend's
+    # isLabel flag, which is what auto-escapes `#`/`>` and strips block elements
+    # elsewhere — so an uncollapsed newline would open a heading and a blockquote
+    # inside the error box. Every block construct needs a line start.
+    with patch("streamlit_app._transcribe", side_effect=RuntimeError("boom")):
+        _handle_transcription(
+            [_make_file(name="clip\n\n# Big\n\n> quote.mp3")], **_handle_transcription_kwargs()
+        )
+
+    # `#` and `>` are deliberately *not* in the escape class — losing the line
+    # start is what defuses them, so they survive as literal characters.
+    (message,), kwargs = mock_st.error.call_args
+    assert "\n" not in message
+    assert message == "Transcription failed for clip # Big > quote.mp3: boom"
+    assert kwargs == {"icon": ":material/error:"}
+
+
 @pytest.mark.parametrize(
     "ui_kwargs,expected_overrides",
     [
@@ -815,10 +834,23 @@ def test_format_srt_escapes_arrow():
         ("interview.mp3", "interview.mp3"),
         ("interview_part_1.mp3", r"interview\_part\_1.mp3"),
         ("Song [Official Video].mp3", r"Song \[Official Video\].mp3"),
-        ("a*b`c~d:e$f", r"a\*b\`c\~d\:e\$f"),
+        ("a*b`c~d:e$f&g", r"a\*b\`c\~d\:e\$f\&g"),
         (r"back\slash", r"back\\slash"),
+        # `&` is escaped because micromark's characterReference is a *parse-time*
+        # construct: unescaped, `&#58;` decodes to a colon early enough for the
+        # frontend's post-parse pass to turn `:streamlit:` into the logo image.
+        ("Rock &amp; Roll.mp3", r"Rock \&amp; Roll.mp3"),
+        ("clip&#58;streamlit&#58;.mp3", r"clip\&#58;streamlit\&#58;.mp3"),
     ],
-    ids=["plain", "underscores", "brackets", "all_specials", "backslash"],
+    ids=[
+        "plain",
+        "underscores",
+        "brackets",
+        "all_specials",
+        "backslash",
+        "named_entity",
+        "numeric_entity",
+    ],
 )
 def test_escape_markdown(raw, expected):
     assert _escape_markdown(raw) == expected
