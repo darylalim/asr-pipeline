@@ -34,6 +34,14 @@ LANGUAGE_CODES: list[str | None] = [None] + sorted(LANGUAGES, key=lambda c: LANG
 YOUTUBE_URL_RE = re.compile(r"^https?://(www\.|m\.)?(youtube\.com/|youtu\.be/)", re.IGNORECASE)
 URL_RE = re.compile(r"^https?://", re.IGNORECASE)
 MAX_URL_DOWNLOAD_BYTES = 500 * 1024 * 1024
+# Width of a right-hand control in a _control_row(). st.selectbox has no
+# width="content" (its default is "stretch", which fills a horizontal container),
+# so this reproduces what st.columns([3, 1]) yields and keeps the language
+# selector the same width as the Transcribe and Download buttons, which still
+# use that split. Measured in the running app: the `centered` layout's main
+# block has a 704px content box and st.columns puts a 32px gap between the two,
+# so the right column is (704 - 32) / 4 = 168px.
+SELECT_WIDTH = 168
 PAGE_CONFIG: dict[str, Any] = {
     "page_title": "Whisper Transcribe",
     "page_icon": ":material/graphic_eq:",
@@ -195,6 +203,12 @@ def _handle_transcription(
     # BaseException that `except Exception` will not catch — so assigning only
     # after the loop would discard every file already transcribed.
     st.session_state["transcription"] = transcriptions
+    # Bump the batch id alongside that publish so _display_transcription's widget
+    # keys change with the batch. A keyed st.text_area restores its session-state
+    # value and ignores the `value` argument, so reusing transcript_{i} across
+    # batches renders the *previous* batch's text under the new filename — and the
+    # Download button, whose payload is the text area's return value, serves it.
+    st.session_state["batch_id"] = st.session_state.get("batch_id", 0) + 1
     total = len(uploaded_files)
     with st.status(f"Transcribing {total} file(s)...", expanded=True) as status:
         for i, uploaded_file in enumerate(uploaded_files, start=1):
@@ -235,17 +249,30 @@ def _handle_transcription(
         )
 
 
+def _control_row():
+    """One labelled-control row: label left, control right, vertically centred.
+
+    A horizontal container rather than st.columns([3, 1]) because the ratio was
+    never load-bearing here — only the flush-right edge is — and columns stack
+    vertically on a narrow viewport, which breaks the row into two lines.
+    `horizontal_alignment="distribute"` is space-between with two children and
+    plain left-alignment with one, so _field_label shares the same row metrics.
+    """
+    return st.container(
+        horizontal=True,
+        horizontal_alignment="distribute",
+        vertical_alignment="center",
+    )
+
+
 def _labeled_toggle(label: str, help_text: str) -> bool:
-    label_col, input_col = st.columns([3, 1], vertical_alignment="center")
-    with label_col:
+    with _control_row():
         st.markdown(label, help=help_text)
-    with input_col, st.container(horizontal_alignment="right"):
         return st.toggle(label, value=False, label_visibility="collapsed")
 
 
 def _field_label(label: str, help_text: str) -> None:
-    label_col, _ = st.columns([3, 1], vertical_alignment="center")
-    with label_col:
+    with _control_row():
         st.markdown(label, help=help_text)
 
 
@@ -272,6 +299,8 @@ def _transcription_kwargs(
 
 def _display_transcription() -> None:
     transcriptions = st.session_state.get("transcription") or []
+    # Namespaces the widget keys below by batch; see _handle_transcription.
+    batch = st.session_state.get("batch_id", 0)
     for i, data in enumerate(transcriptions):
         include_subtitles = data["include_subtitles"]
         if include_subtitles:
@@ -284,7 +313,7 @@ def _display_transcription() -> None:
             initial,
             height=300,
             label_visibility="collapsed",
-            key=f"transcript_{i}",
+            key=f"transcript_b{batch}_{i}",
         )
         ext, mime = ("srt", "application/x-subrip") if include_subtitles else ("txt", "text/plain")
         _, download_col = st.columns([3, 1])
@@ -295,7 +324,7 @@ def _display_transcription() -> None:
                 f"{data['file_stem']}.{ext}",
                 mime,
                 icon=":material/download:",
-                key=f"download_{ext}_{i}",
+                key=f"download_{ext}_b{batch}_{i}",
                 help="Downloads as .srt when subtitles are enabled, .txt otherwise.",
                 width="stretch",
             )
@@ -339,22 +368,13 @@ with youtube_tab:
         placeholder="https://www.youtube.com/watch?v=...",
         label_visibility="collapsed",
     ).strip()
-    youtube_audio: _RemoteAudio | None = None
-    # Gate the fetch — not the text input — on tab visibility. st.tabs computes
-    # hidden bodies by default, so an ungated fetch downloads while the user is on
-    # another tab, and the Transcribe dispatch prioritizes uploads anyway. The
-    # input stays outside the guard because Streamlit drops state for widgets it
-    # doesn't render, which would clear the typed URL on every tab switch.
-    if youtube_tab.open and youtube_url and YOUTUBE_URL_RE.match(youtube_url):
-        try:
-            data, filename = _fetch_youtube_audio(youtube_url)
-            youtube_audio = _RemoteAudio(filename, data)
-            st.audio(data)
-        except yt_dlp.utils.DownloadError as e:
-            st.error(f"Could not download from YouTube: {e}")
-        except Exception as e:
-            st.error(f"Unexpected error: {e}")
-            st.exception(e)
+    # Reserve the preview's slot here and run the fetch further down, after the
+    # controls have rendered. Streamlit paints top to bottom, so a fetch at this
+    # position leaves the language selector, every toggle, and Advanced options
+    # greyed out as stale for the length of the download. Writing back into this
+    # container keeps the preview — and the cache's own download spinner, the
+    # only progress signal on this path — inside the tab where they belong.
+    youtube_slot = st.container()
 
 with url_tab:
     file_url = st.text_input(
@@ -362,24 +382,9 @@ with url_tab:
         placeholder="Audio/video file URL",
         label_visibility="collapsed",
     ).strip()
-    url_audio: _RemoteAudio | None = None
-    # Fetch gated on tab visibility for the same reason as the YouTube tab above.
-    if url_tab.open and file_url and URL_RE.match(file_url):
-        if YOUTUBE_URL_RE.match(file_url):
-            st.info("This looks like a YouTube URL — use the YouTube tab.")
-        else:
-            try:
-                data, filename = _fetch_url_audio(file_url)
-                url_audio = _RemoteAudio(filename, data)
-                st.audio(data)
-            except (URLError, RuntimeError) as e:
-                st.error(f"Could not download from URL: {e}")
-            except Exception as e:
-                st.error(f"Unexpected error: {e}")
-                st.exception(e)
+    url_slot = st.container()  # Deferred like the YouTube preview above.
 
-language_label_col, language_col = st.columns([3, 1], vertical_alignment="center")
-with language_label_col:
+with _control_row():
     st.markdown(
         "Primary language",
         help=(
@@ -387,10 +392,10 @@ with language_label_col:
             "By default, the primary language will be detected automatically."
         ),
     )
-with language_col:
     language = st.selectbox(
         "Primary language",
         LANGUAGE_CODES,
+        width=SELECT_WIDTH,
         format_func=_format_language,
         label_visibility="collapsed",
     )
@@ -401,13 +406,14 @@ translate = _labeled_toggle(
 )
 include_subtitles = _labeled_toggle(
     "Include subtitles",
-    "Best for adding subtitles to a video. When enabled, the project will be "
-    "initialized with subtitles which you can then alter in the editor.",
+    "Best for adding subtitles to a video. Shows the transcript as editable, "
+    "timestamped SRT cues, and switches the Download button from .txt to .srt.",
 )
 no_verbatim = _labeled_toggle(
     "No verbatim",
-    "When enabled, the transcription will be cleaned up by removing "
-    "filler words, false starts, and repetitions.",
+    "Skips silent stretches where Whisper appears to be hallucinating text, "
+    "such as over music or applause after speech ends. Does not remove "
+    "filler words or repetitions.",
 )
 with st.expander("Advanced options", icon=":material/tune:"):
     decode_independently = _labeled_toggle(
@@ -444,6 +450,41 @@ with st.expander("Advanced options", icon=":material/tune:"):
         label_visibility="collapsed",
     )
     initial_prompt = ", ".join(keyterms) or None
+
+# Remote fetches run here, below every control, and write back into the slots
+# reserved inside their tabs. Each is gated on tab visibility — not on the text
+# input above, which must always render: st.tabs computes hidden bodies by
+# default, so an ungated fetch downloads while the user is on another tab, and
+# Streamlit drops state for widgets it doesn't render, which would clear the
+# typed URL on every tab switch.
+youtube_audio: _RemoteAudio | None = None
+if youtube_tab.open and youtube_url and YOUTUBE_URL_RE.match(youtube_url):
+    with youtube_slot:
+        try:
+            data, filename = _fetch_youtube_audio(youtube_url)
+            youtube_audio = _RemoteAudio(filename, data)
+            st.audio(data)
+        except yt_dlp.utils.DownloadError as e:
+            st.error(f"Could not download from YouTube: {e}")
+        except Exception as e:
+            st.error(f"Unexpected error: {e}")
+            st.exception(e)
+
+url_audio: _RemoteAudio | None = None
+if url_tab.open and file_url and URL_RE.match(file_url):
+    with url_slot:
+        if YOUTUBE_URL_RE.match(file_url):
+            st.info("This looks like a YouTube URL — use the YouTube tab.")
+        else:
+            try:
+                data, filename = _fetch_url_audio(file_url)
+                url_audio = _RemoteAudio(filename, data)
+                st.audio(data)
+            except (URLError, RuntimeError) as e:
+                st.error(f"Could not download from URL: {e}")
+            except Exception as e:
+                st.error(f"Unexpected error: {e}")
+                st.exception(e)
 
 audio_sources = (
     uploaded_files

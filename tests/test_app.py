@@ -76,10 +76,17 @@ def _stub_ytdlp(mock_yt_dlp, path, title="Test"):
 
 
 def _make_transcription(
-    include_subtitles=False, file_stem="interview_transcript", filename="interview.mp3"
+    include_subtitles=False,
+    file_stem="interview_transcript",
+    filename="interview.mp3",
+    text=None,
 ):
+    result = MOCK_WHISPER_RESULT
+    if text is not None:
+        # Only the keys _display_transcription and _format_srt read.
+        result = {"text": text, "segments": [{"start": 0.0, "end": 2.5, "text": text}]}
     return {
-        "result": MOCK_WHISPER_RESULT,
+        "result": result,
         "file_stem": file_stem,
         "filename": filename,
         "include_subtitles": include_subtitles,
@@ -476,6 +483,25 @@ def test_handle_transcription_clears_previous_batch(mock_transcribe, mock_st):
     assert mock_st.session_state["transcription"] == []
 
 
+@patch("streamlit_app._transcribe")
+def test_handle_transcription_bumps_batch_id(mock_transcribe, mock_st):
+    # The batch id namespaces _display_transcription's widget keys, so every
+    # batch must advance it — including one where every file fails, since the
+    # stale text area would otherwise outlive the results it was rendered from.
+    mock_transcribe.return_value = MOCK_WHISPER_RESULT
+    kwargs = _handle_transcription_kwargs()
+
+    _handle_transcription([_make_file()], **kwargs)
+    assert mock_st.session_state["batch_id"] == 1
+
+    _handle_transcription([_make_file("second.mp3")], **kwargs)
+    assert mock_st.session_state["batch_id"] == 2
+
+    mock_transcribe.side_effect = RuntimeError("Transcription produced no text")
+    _handle_transcription([_make_file("third.mp3")], **kwargs)
+    assert mock_st.session_state["batch_id"] == 3
+
+
 # --- _transcription_kwargs ---
 
 
@@ -529,7 +555,7 @@ def test_display_transcription_shows_transcript(mock_st):
         "Hello world",
         height=300,
         label_visibility="collapsed",
-        key="transcript_0",
+        key="transcript_b0_0",
     )
     mock_st.subheader.assert_called_once_with("interview.mp3")
 
@@ -545,7 +571,7 @@ def test_display_transcription_txt_download(mock_st):
         "interview_transcript.txt",
         "text/plain",
         icon=":material/download:",
-        key="download_txt_0",
+        key="download_txt_b0_0",
         help="Downloads as .srt when subtitles are enabled, .txt otherwise.",
         width="stretch",
     )
@@ -562,7 +588,7 @@ def test_display_transcription_srt_download(mock_st):
         "interview_transcript.srt",
         "application/x-subrip",
         icon=":material/download:",
-        key="download_srt_0",
+        key="download_srt_b0_0",
         help="Downloads as .srt when subtitles are enabled, .txt otherwise.",
         width="stretch",
     )
@@ -578,7 +604,7 @@ def test_display_transcription_subtitles_on(mock_st):
         SRT_HELLO,
         height=300,
         label_visibility="collapsed",
-        key="transcript_0",
+        key="transcript_b0_0",
     )
     mock_st.subheader.assert_called_once_with("interview.mp3")
 
@@ -595,7 +621,7 @@ def test_display_transcription_download_reflects_edits(mock_st):
         "interview_transcript.txt",
         "text/plain",
         icon=":material/download:",
-        key="download_txt_0",
+        key="download_txt_b0_0",
         help="Downloads as .srt when subtitles are enabled, .txt otherwise.",
         width="stretch",
     )
@@ -628,6 +654,16 @@ def test_display_transcription_escapes_filename_in_subheader(mock_st):
     _display_transcription()
 
     mock_st.subheader.assert_called_once_with(r"my\_song \[live\].mp3")
+
+
+def test_display_transcription_keys_are_namespaced_by_batch(mock_st):
+    mock_st.session_state["batch_id"] = 7
+    mock_st.session_state["transcription"] = [_make_transcription()]
+
+    _display_transcription()
+
+    assert mock_st.text_area.call_args.kwargs["key"] == "transcript_b7_0"
+    assert mock_st.download_button.call_args.kwargs["key"] == "download_txt_b7_0"
 
 
 # --- formatting helpers ---
@@ -810,6 +846,55 @@ def test_no_results_renders_no_download_button():
     assert _run_app().get("download_button") == []
 
 
+def _publish(at, transcription, batch):
+    # Mirrors _handle_transcription's publish: the results plus the batch id
+    # that namespaces the transcript widget keys.
+    at.session_state["transcription"] = transcription
+    at.session_state["batch_id"] = batch
+    return at.run()
+
+
+def test_new_batch_replaces_previous_transcript_text():
+    # A keyed st.text_area restores its session-state value and ignores the
+    # `value` argument, so a batch-invariant key renders the *previous* batch's
+    # text under the new filename -- and the Download button, whose payload is
+    # the text area's return value, serves it. This needs two renders with
+    # different data; no single-render test can see it.
+    at = AppTest.from_file(str(APP_PATH), default_timeout=5)
+    _publish(at, [_make_transcription(filename="first.mp3")], batch=1)
+    assert at.text_area[0].value == "Hello world"
+
+    # Edits must still stick *within* a batch -- that is the point of the key.
+    at.text_area[0].set_value("edited by hand").run()
+    assert at.text_area[0].value == "edited by hand"
+
+    _publish(at, [_make_transcription(filename="second.mp3", text="Second file text")], batch=2)
+    assert not at.exception
+    assert [s.value for s in at.subheader] == ["second.mp3"]
+    assert at.text_area[0].value == "Second file text"
+
+
+def test_new_batch_replaces_previous_transcript_when_subtitles_toggled():
+    # Flipping include_subtitles changes only the *download* key (txt -> srt),
+    # so without the batch namespace the transcript text area stays stale and
+    # the SRT cues never reach the screen.
+    at = AppTest.from_file(str(APP_PATH), default_timeout=5)
+    _publish(at, [_make_transcription(filename="first.mp3")], batch=1)
+    assert at.text_area[0].value == "Hello world"
+
+    _publish(
+        at,
+        [
+            _make_transcription(
+                filename="second.mp3", text="Second file text", include_subtitles=True
+            )
+        ],
+        batch=2,
+    )
+    assert not at.exception
+    assert at.text_area[0].value == "1\n00:00:00,000 --> 00:00:02,500\nSecond file text\n"
+
+
 # The remote-fetch tabs gate their download on `tab.open` because st.tabs
 # computes hidden tab bodies by default. Network entry points are patched on
 # their own modules (urllib.request / yt_dlp) rather than on streamlit_app,
@@ -864,6 +949,40 @@ def test_youtube_fetch_gated_on_tab_visibility(active_tab, expected_calls, tmp_p
     assert not at.exception
     assert ydl.extract_info.call_count == expected_calls
     assert _typed_value(at, "YouTube URL") == url
+
+
+def _tab(at, label):
+    return next(t for t in at.tabs if t.label == label)
+
+
+# The fetches themselves run below every control so a slow download does not
+# grey out the language selector, the toggles, and Advanced options. They write
+# back into an st.container() reserved inside their tab, so the preview must
+# still resolve *within* that tab -- dropping the slot would strand it at the
+# bottom of the page, under the Transcribe button.
+
+
+def test_url_preview_renders_inside_its_tab():
+    with patch("urllib.request.urlopen") as mock_urlopen:
+        _stub_urlopen(mock_urlopen, b"file bytes")
+        at = _type_url("Audio/video file URL", "https://example.com/audio.mp3", URL_TAB)
+    assert not at.exception
+    assert len(_tab(at, URL_TAB).get("audio")) == 1
+    assert _tab(at, UPLOAD_TAB).get("audio") == []
+
+
+def test_youtube_preview_renders_inside_its_tab(tmp_path):
+    fake_file = tmp_path / "Clip.m4a"
+    fake_file.write_bytes(b"yt bytes")
+    with patch("yt_dlp.YoutubeDL") as mock_ydl_cls:
+        ydl = MagicMock()
+        ydl.extract_info.return_value = {"title": "Clip"}
+        ydl.prepare_filename.return_value = str(fake_file)
+        mock_ydl_cls.return_value.__enter__.return_value = ydl
+        at = _type_url("YouTube URL", "https://youtube.com/watch?v=slot", YOUTUBE_TAB)
+    assert not at.exception
+    assert len(_tab(at, YOUTUBE_TAB).get("audio")) == 1
+    assert _tab(at, UPLOAD_TAB).get("audio") == []
 
 
 def test_active_remote_tab_enables_transcribe():

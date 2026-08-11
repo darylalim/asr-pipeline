@@ -16,7 +16,7 @@ Transcribe and translate audio and video **locally on your Mac** — no cloud, n
 - **Translate non-English audio to English**
 - **Four input modes** — multi-file upload (up to 500 MB per file), in-browser recording, YouTube links, and direct audio/video file URLs
 - **Editable subtitle preview**, exportable as SRT (the standard subtitle file format)
-- **No verbatim** — removes filler words, false starts, and repetitions
+- **No verbatim** — skips hallucinated text over music, applause, and other non-speech audio
 - **Decode segments independently** — more robust on noisy or music-heavy audio
 - **Time-range clipping** — transcribe only selected portions (comma-separated `start,end` pairs in seconds)
 - **Keyterms** — bias decoding toward proper nouns and jargon (up to 50 terms)
@@ -60,7 +60,7 @@ Optional controls:
 - **Primary language** — auto-detected by default
 - **Translate to English** — translate non-English audio
 - **Include subtitles** — show an editable SRT subtitle preview; the **Download** button then serves a `.srt` file instead of `.txt`
-- **No verbatim** — remove filler words, false starts, and repetitions
+- **No verbatim** — skip silent stretches where Whisper appears to be hallucinating text, such as over music or applause after speech ends; it does not remove filler words or repetitions
 - **Decode segments independently** — disable prior-window context; more robust on noisy or music-heavy audio, at the cost of slightly choppier wording where 30 s windows meet
 - **Time range** — transcribe only selected portions; comma-separated `start,end` pairs in seconds (e.g., `30,90` for one clip, `0,60,120,180` for multiple); invalid ranges are flagged inline
 - **Keyterms** — bias decoding toward specific terms (proper nouns, jargon)
