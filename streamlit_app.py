@@ -182,26 +182,36 @@ _MARKDOWN_ESCAPE_RE = re.compile(r"([\\`*_~\[\]:$&])")
 
 
 def _escape_markdown(text: str) -> str:
-    """Backslash-escape characters Streamlit's label-subset Markdown interprets.
+    """Render `text` literally at any of this app's Markdown sinks.
 
-    st.subheader renders the Markdown label subset, so a filename containing *, _,
+    Filenames are untrusted: `_fetch_url_audio` percent-decodes them off the URL
+    path, so `%5B` / `%28` arrive as live syntax and `%0A` as a real newline.
+
+    Two mechanisms, because Markdown has two layers:
+
+    *Inline* constructs are backslash-escaped. A filename containing *, _,
     backticks, brackets, or : (emoji/Material-icon directives) — common in YouTube
-    titles and underscored names — would otherwise mis-render. Escaping keeps the
-    displayed name literal.
+    titles and underscored names — would otherwise mis-render. `&` is in the class
+    because micromark's characterReference is a parse-time construct: without it
+    `clip&#58;streamlit&#58;.mp3` decodes to a live `:streamlit:` that the
+    frontend's post-parse pass swaps for the logo image, and `Rock &amp; Roll.mp3`
+    displays as `Rock & Roll.mp3`. `&` is ASCII punctuation, so `\\&` is a valid
+    CommonMark characterEscape.
 
-    `&` is in the class because micromark's characterReference construct is a
-    parse-time one: without it `clip&#58;streamlit&#58;.mp3` decodes to a live
-    `:streamlit:` that the frontend's post-parse pass then swaps for the logo
-    image, and `Rock &amp; Roll.mp3` displays as `Rock & Roll.mp3`. `&` is ASCII
-    punctuation, so `\\&` is a valid CommonMark characterEscape.
+    *Block* constructs are defused by collapsing whitespace, not by escaping:
+    headings, blockquotes, lists, thematic breaks and GFM tables all need a line
+    start, so removing newlines removes every one of them at once — a smaller
+    change than adding #, >, -, +, | and the ordered-list forms to the class.
+    This has to happen here rather than at one call site, because *two* sinks
+    render without the frontend's isLabel flag (which is what would otherwise
+    auto-escape block markers and strip block elements):
 
-    This handles inline constructs only. Block markers (#, >, -, +, |) are left
-    live, and are neutralized instead by collapsing whitespace at the call site —
-    every block construct needs a line start, so removing newlines removes all of
-    them at once. That matters only for st.error, whose body is the one sink
-    rendered without the frontend's isLabel guard.
+    - `st.error`'s body — AlertElement passes isLabel for the alert title only.
+    - `st.subheader` — the heading component does `[first, ...rest] = body.split("\\n")`
+      and renders `rest` through a bare `StreamlitMarkdown` with no isLabel and no
+      disallowedElements, so everything after the first newline is full Markdown.
     """
-    return _MARKDOWN_ESCAPE_RE.sub(r"\\\1", text)
+    return _MARKDOWN_ESCAPE_RE.sub(r"\\\1", " ".join(text.split()))
 
 
 def _validate_time_range(raw: str) -> str | None:
@@ -299,17 +309,22 @@ def _handle_transcription(
             # label takes the Markdown label subset — which includes images, so a
             # filename carrying `![](https://host/x.png)` would fetch on *every*
             # file, not just a failure — and st.error below renders full Markdown.
-            # Filenames are not trusted input: _fetch_url_audio percent-decodes
-            # them off the URL path, so `%5B`/`%28` arrive as live syntax — and
-            # `%0A` arrives as a real newline. Collapsing whitespace is what
-            # handles that half: st.error's *body* renders without the frontend's
-            # isLabel flag, which is what auto-escapes `#`/`>`/`-`/`+` and strips
-            # block elements at every other sink, so a newline here would open a
-            # heading or blockquote inside the error box. Every block construct
-            # needs a line start, so removing newlines closes all of them at once.
-            name_md = _escape_markdown(" ".join(uploaded_file.name.split()))
+            # See _escape_markdown for what it does and does not cover.
+            name_md = _escape_markdown(uploaded_file.name)
             status.update(label=f"Transcribing {name_md} ({i}/{total})...")
             name = Path(uploaded_file.name)
+            # Rewind before reading. UploadedFile subclasses io.BytesIO, and the
+            # deserialized widget value is cached in session state
+            # (WStates.__getitem__ stores Value(deserialized)), so the *same*
+            # object — and the same cursor — survives every rerun. read() leaves
+            # it at EOF, so a second Transcribe on an unchanged recording would
+            # hand _transcribe b"". This used to be masked by st.audio's own
+            # data.seek(0) inside _marshall_av_media, which ran once per rerun for
+            # each preview; that is a side effect of a display call, not a
+            # contract, and the Record tab deliberately renders no preview.
+            # _RemoteAudio has no cursor and needs no rewind.
+            if isinstance(uploaded_file, UploadedFile):
+                uploaded_file.seek(0)
             try:
                 result = _transcribe(
                     uploaded_file.read(),

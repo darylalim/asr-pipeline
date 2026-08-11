@@ -3,6 +3,8 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 import streamlit as st
+from streamlit.proto.Common_pb2 import FileURLs
+from streamlit.runtime.uploaded_file_manager import UploadedFile, UploadedFileRec
 from streamlit.testing.v1 import AppTest
 
 from streamlit_app import (
@@ -466,6 +468,23 @@ def test_handle_transcription_escapes_filename_in_status_label(mock_transcribe, 
     status.update.assert_any_call(label=r"Transcribing clip \[1\].mp3 (1/1)...")
 
 
+def test_handle_transcription_rewinds_the_cursor_before_reading(mock_st):
+    # UploadedFile subclasses io.BytesIO, and the deserialized widget value is
+    # cached in session state (WStates.__getitem__ stores Value(deserialized)), so
+    # the same object -- and the same cursor -- survives every rerun. read() leaves
+    # it at EOF. st.audio used to rewind it as a side effect of rendering a preview
+    # (_marshall_av_media calls data.seek(0)); the Record tab renders none, so a
+    # second Transcribe on an unchanged recording would otherwise transcribe b"".
+    rec = UploadedFileRec("id", "recording.wav", "audio/wav", b"real audio bytes")
+    recording = UploadedFile(rec, FileURLs())
+
+    with patch("streamlit_app._transcribe", return_value=MOCK_WHISPER_RESULT) as mock_transcribe:
+        _handle_transcription([recording], **_handle_transcription_kwargs())
+        _handle_transcription([recording], **_handle_transcription_kwargs())
+
+    assert [c.args[0] for c in mock_transcribe.call_args_list] == [b"real audio bytes"] * 2
+
+
 def test_handle_transcription_collapses_whitespace_in_filename(mock_st):
     # _fetch_url_audio percent-decodes off the URL path, so `%0A` arrives as a real
     # newline. st.error's body is the one sink rendered without the frontend's
@@ -768,6 +787,24 @@ def test_display_transcription_escapes_filename_in_subheader(mock_st):
     mock_st.subheader.assert_called_once_with(r"my\_song \[live\].mp3")
 
 
+def test_display_transcription_collapses_whitespace_in_subheader(mock_st):
+    # st.subheader is NOT protected by the frontend's isLabel guard, contrary to
+    # what a Markdown "label subset" implies: the heading component does
+    # `[first, ...rest] = body.split("\n")` and renders `rest` through a bare
+    # StreamlitMarkdown with no isLabel and no disallowedElements. So every line
+    # after the first is full Markdown -- the same unguarded sink as st.error's
+    # body. This filename is reachable verbatim from a URL ending
+    # `/clip%0A%0A%23%20Big%0A%0A%3E%20quote.mp3`, since _fetch_url_audio
+    # percent-decodes and the raw name is what lands in the transcription dict.
+    mock_st.session_state["transcription"] = [
+        _make_transcription(filename="clip\n\n# Big\n\n> quote.mp3")
+    ]
+
+    _display_transcription()
+
+    mock_st.subheader.assert_called_once_with("clip # Big > quote.mp3")
+
+
 def test_display_transcription_keys_are_namespaced_by_batch(mock_st):
     mock_st.session_state["batch_id"] = 7
     mock_st.session_state["transcription"] = [_make_transcription()]
@@ -837,6 +874,8 @@ def test_format_srt_escapes_arrow():
         ("interview.wav", "audio/wav"),
         ("interview.opus", "audio/ogg"),
         ("clip.mp4", "video/mp4"),
+        ("clip.mov", "video/quicktime"),
+        ("clip.webm", "video/webm"),
         ("clip.mkv", "video/x-matroska"),
         ("SHOUTING.MP3", "audio/mpeg"),
         ("archive.flac", "audio/flac"),
@@ -852,6 +891,8 @@ def test_format_srt_escapes_arrow():
         "wav",
         "opus",
         "mp4",
+        "mov",
+        "webm",
         "mkv",
         "uppercase",
         "not_in_upload_formats",
@@ -878,6 +919,12 @@ def test_media_mime(filename, expected):
         # frontend's post-parse pass to turn `:streamlit:` into the logo image.
         ("Rock &amp; Roll.mp3", r"Rock \&amp; Roll.mp3"),
         ("clip&#58;streamlit&#58;.mp3", r"clip\&#58;streamlit\&#58;.mp3"),
+        # Block markers are defused by losing the line start, not by escaping --
+        # `#` and `>` come back literal. Both sinks that render without the
+        # frontend's isLabel flag (st.error's body and st.subheader's lines after
+        # the first) depend on this, so it lives here rather than at a call site.
+        ("clip\n\n# Big\n\n> quote.mp3", "clip # Big > quote.mp3"),
+        ("spaced   out\ttabbed.mp3", "spaced out tabbed.mp3"),
     ],
     ids=[
         "plain",
@@ -887,6 +934,8 @@ def test_media_mime(filename, expected):
         "backslash",
         "named_entity",
         "numeric_entity",
+        "block_markers",
+        "whitespace_runs",
     ],
 )
 def test_escape_markdown(raw, expected):
