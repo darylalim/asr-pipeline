@@ -70,8 +70,14 @@ MAX_DOWNLOAD_BYTES = 500 * 1024 * 1024
 # Shared width of every right-hand control: the language selectbox and the
 # Transcribe and Download buttons. It has to be an explicit number because
 # st.selectbox has no width="content" (its default is "stretch", which fills a
-# horizontal container); the two buttons take the same value so all three share
-# a right edge. Originally reverse-engineered from st.columns([3, 1]) — the
+# horizontal container); the two buttons take the same value so all three are
+# the same width. Note that is a shared *width*, not a shared right *edge*:
+# Download sits inside _display_transcription's st.container(border=True), whose
+# 15px padding plus 1px border insets the content box from 704px to 672px, so
+# Download lands 16px in (x=768, right=936) from the selectbox and Transcribe
+# (x=784, right=952). That inset is correct — it makes Download flush with the
+# text area inside its own card — and is not removable without custom CSS, which
+# this app does not use. Originally reverse-engineered from st.columns([3, 1]) — the
 # `centered` layout's main block has a 704px content box and st.columns puts a
 # 32px gap between the two columns, so the right column was (704 - 32) / 4 =
 # 168px — and kept at that value so the rendered layout is unchanged now that
