@@ -469,9 +469,12 @@ with upload_tab:
         st.audio(uploaded_file, format=_media_mime(uploaded_file.name))
 
 with record_tab:
+    # No st.audio preview here, unlike the other three tabs. st.audio_input is not
+    # a bare capture control — it renders its own WaveSurfer player (interactive
+    # waveform, timecode, Play/Pause as soon as a recording exists, and a
+    # "Clear recording" action), so an st.audio call would stack a second,
+    # visually different player on the same bytes.
     recorded_audio = st.audio_input("Record audio", label_visibility="collapsed")
-    if recorded_audio:
-        st.audio(recorded_audio)
 
 with youtube_tab:
     youtube_url = st.text_input(
