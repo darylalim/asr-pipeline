@@ -1,5 +1,5 @@
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 import streamlit as st
@@ -8,7 +8,9 @@ from streamlit.testing.v1 import AppTest
 from streamlit_app import (
     ASR_MODEL_REPO,
     AUDIO_FORMATS,
+    MAX_DOWNLOAD_BYTES,
     PAGE_CONFIG,
+    SELECT_WIDTH,
     VIDEO_FORMATS,
     _display_transcription,
     _escape_markdown,
@@ -48,6 +50,16 @@ MOCK_WHISPER_RESULT = {
 }
 
 SRT_HELLO = "1\n00:00:00,000 --> 00:00:02,500\nHello world\n"
+
+# Spelled out rather than imported from streamlit_app — this *is* the assertion,
+# so reading the app's own value would make the pin tautological. The second
+# sentence is load-bearing: st.download_button bakes its payload at render time,
+# so an uncommitted text-area edit is silently dropped (verified in Chrome).
+DOWNLOAD_HELP = (
+    "Downloads as .srt when subtitles are enabled, .txt otherwise. "
+    "Commit an edit first — click outside the box or press "
+    "Ctrl/Cmd+Enter — or the download will miss it."
+)
 
 
 # --- Helpers ---
@@ -132,9 +144,13 @@ def _clear_caches():
     _fetch_url_audio.clear()
     # The wrappers above only reach caches created by the imported module.
     # AppTest re-executes the script as a separate module with its own
-    # cache_data store, which would otherwise persist for the whole session
+    # cache store, which would otherwise persist for the whole session
     # and let a fetch-was-skipped assertion pass on a stale cache hit.
     st.cache_data.clear()
+    # Both are required: the two fetch functions are @st.cache_resource, which
+    # lives in a different singleton store than @st.cache_data (_transcribe).
+    # Dropping this makes the tab-gate cases order-dependent.
+    st.cache_resource.clear()
 
 
 @pytest.fixture
@@ -261,7 +277,7 @@ def test_fetch_url_audio_filename(mock_urlopen, url, expected_filename):
     assert filename == expected_filename
 
 
-@patch("streamlit_app.MAX_URL_DOWNLOAD_BYTES", 10)
+@patch("streamlit_app.MAX_DOWNLOAD_BYTES", 10)
 @patch("streamlit_app.urlopen")
 def test_fetch_url_audio_rejects_oversized_response(mock_urlopen):
     response = _stub_urlopen(mock_urlopen, b"x" * 11)
@@ -270,6 +286,32 @@ def test_fetch_url_audio_rejects_oversized_response(mock_urlopen):
         _fetch_url_audio("https://example.com/too-big.mp3")
 
     response.read.assert_called_once_with(11)
+
+
+@patch("streamlit_app.MAX_DOWNLOAD_BYTES", 10)
+@patch("streamlit_app.yt_dlp")
+def test_fetch_youtube_audio_rejects_oversized_download(mock_yt_dlp, tmp_path):
+    # yt-dlp's own max_filesize only fires where a Content-Length is known and
+    # is never read by the fragmented downloaders, so the on-disk stat() gate is
+    # what actually stops a livestream VOD from being slurped into one bytes
+    # object. Deleting it must fail here.
+    fake_file = tmp_path / "huge.m4a"
+    fake_file.write_bytes(b"x" * 11)
+    _stub_ytdlp(mock_yt_dlp, fake_file, title="huge")
+
+    with pytest.raises(RuntimeError, match="exceeds"):
+        _fetch_youtube_audio("https://youtube.com/watch?v=too_big")
+
+
+@patch("streamlit_app.yt_dlp")
+def test_fetch_youtube_audio_passes_max_filesize(mock_yt_dlp, tmp_path):
+    fake_file = tmp_path / "video.webm"
+    fake_file.write_bytes(b"webm bytes")
+    _stub_ytdlp(mock_yt_dlp, fake_file, title="video")
+
+    _fetch_youtube_audio("https://youtube.com/watch?v=max_filesize")
+
+    assert mock_yt_dlp.YoutubeDL.call_args.args[0]["max_filesize"] == MAX_DOWNLOAD_BYTES
 
 
 # --- _transcribe ---
@@ -388,6 +430,36 @@ def test_handle_transcription_unexpected_error(mock_transcribe, mock_st, mock_up
     )
     mock_st.error.assert_called_once_with("Unexpected error for interview.mp3: unexpected")
     mock_st.exception.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "error,expected",
+    [
+        (RuntimeError("boom"), r"Transcription failed for my\_song \[live\].mp3: boom"),
+        (ValueError("boom"), r"Unexpected error for my\_song \[live\].mp3: boom"),
+    ],
+)
+def test_handle_transcription_escapes_filename_in_error(error, expected, mock_st):
+    # st.error renders *full* Markdown — a strictly larger subset than the label
+    # subset _display_transcription's subheader escapes for. Filenames arrive
+    # percent-decoded from the URL tab, so they are untrusted.
+    with patch("streamlit_app._transcribe", side_effect=error):
+        _handle_transcription(
+            [_make_file(name="my_song [live].mp3")], **_handle_transcription_kwargs()
+        )
+
+    mock_st.error.assert_called_once_with(expected)
+
+
+@patch("streamlit_app._transcribe", return_value=MOCK_WHISPER_RESULT)
+def test_handle_transcription_escapes_filename_in_status_label(mock_transcribe, mock_st):
+    # The status label renders on every file, not just failures, and its Markdown
+    # subset includes images — so an unescaped `![](https://host/x.png)` in a
+    # filename would fetch on the happy path.
+    _handle_transcription([_make_file(name="clip [1].mp3")], **_handle_transcription_kwargs())
+
+    status = mock_st.status.return_value.__enter__.return_value
+    status.update.assert_any_call(label=r"Transcribing clip \[1\].mp3 (1/1)...")
 
 
 @pytest.mark.parametrize(
@@ -572,8 +644,9 @@ def test_display_transcription_txt_download(mock_st):
         "text/plain",
         icon=":material/download:",
         key="download_txt_b0_0",
-        help="Downloads as .srt when subtitles are enabled, .txt otherwise.",
-        width="stretch",
+        help=DOWNLOAD_HELP,
+        on_click="ignore",
+        width=SELECT_WIDTH,
     )
 
 
@@ -589,8 +662,9 @@ def test_display_transcription_srt_download(mock_st):
         "application/x-subrip",
         icon=":material/download:",
         key="download_srt_b0_0",
-        help="Downloads as .srt when subtitles are enabled, .txt otherwise.",
-        width="stretch",
+        help=DOWNLOAD_HELP,
+        on_click="ignore",
+        width=SELECT_WIDTH,
     )
 
 
@@ -622,15 +696,29 @@ def test_display_transcription_download_reflects_edits(mock_st):
         "text/plain",
         icon=":material/download:",
         key="download_txt_b0_0",
-        help="Downloads as .srt when subtitles are enabled, .txt otherwise.",
-        width="stretch",
+        help=DOWNLOAD_HELP,
+        on_click="ignore",
+        width=SELECT_WIDTH,
     )
 
 
 def test_display_transcription_right_aligns_download(mock_st):
     mock_st.session_state["transcription"] = [_make_transcription()]
     _display_transcription()
-    mock_st.columns.assert_called_once_with([3, 1])
+    # "right", never "distribute": a standalone element in a distributed
+    # container is left-aligned, which would silently unstick the shared edge.
+    mock_st.container.assert_any_call(horizontal=True, horizontal_alignment="right")
+
+
+def test_display_transcription_wraps_each_result_in_a_bordered_container(mock_st):
+    mock_st.session_state["transcription"] = [
+        _make_transcription(filename="first.mp3"),
+        _make_transcription(filename="second.mp3"),
+    ]
+
+    _display_transcription()
+
+    assert mock_st.container.call_args_list.count(call(border=True)) == 2
 
 
 def test_display_transcription_multiple_files(mock_st):

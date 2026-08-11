@@ -27,7 +27,7 @@ Transcribe and translate audio and video **locally on your Mac** — no cloud, n
 
 You provide audio or video through one of four tabs (upload, record, YouTube, or URL). The app writes the audio to a temporary file and runs `mlx_whisper.transcribe()` with the Whisper large-v3-turbo model locally on Apple Silicon via MLX. The result is cached, rendered as editable plain text (or SRT when subtitles are enabled), and can be downloaded as `.txt` or `.srt`. See [CLAUDE.md](CLAUDE.md) for the full architecture.
 
-![A completed transcription in Whisper Transcribe — the editable transcript for an uploaded file, with a Download button to save it as .txt or .srt](docs/screenshot-result.png)
+![A completed transcription in Whisper Transcribe — a "Transcribed 1/1 file(s)" status above a bordered result section holding the filename, the editable transcript, and a Download button to save it as .txt or .srt](docs/screenshot-result.png)
 
 ## Requirements
 
@@ -86,7 +86,8 @@ CI runs the same tools on every push to `main` and on pull requests — it uses 
 - **Intel Mac / non–Apple Silicon** — `mlx-whisper` requires Apple Silicon and will not run on Intel Macs.
 - **Long pause on the first transcription** — the model weights (~1.5 GB) are downloading from Hugging Face (see the *First run* note above); this needs a network connection and only happens once.
 - **YouTube download fails** — this usually means `yt-dlp` is out of date; update it with `uv lock --upgrade-package yt-dlp && uv sync`.
-- **URL download rejected** — direct audio/video URLs are capped at 500 MB.
+- **Remote download rejected** — both remote fetches are capped at 500 MB: direct audio/video URLs, and YouTube audio (a multi-hour livestream VOD can exceed it).
+- **Download is missing your last edit** — the transcript box commits when it loses focus, so click outside it (or press Ctrl/Cmd+Enter) before pressing **Download**.
 
 ## License
 

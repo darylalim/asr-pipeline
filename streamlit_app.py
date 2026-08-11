@@ -33,14 +33,20 @@ VIDEO_FORMATS = (
 LANGUAGE_CODES: list[str | None] = [None] + sorted(LANGUAGES, key=lambda c: LANGUAGES[c])
 YOUTUBE_URL_RE = re.compile(r"^https?://(www\.|m\.)?(youtube\.com/|youtu\.be/)", re.IGNORECASE)
 URL_RE = re.compile(r"^https?://", re.IGNORECASE)
-MAX_URL_DOWNLOAD_BYTES = 500 * 1024 * 1024
-# Width of a right-hand control in a _control_row(). st.selectbox has no
-# width="content" (its default is "stretch", which fills a horizontal container),
-# so this reproduces what st.columns([3, 1]) yields and keeps the language
-# selector the same width as the Transcribe and Download buttons, which still
-# use that split. Measured in the running app: the `centered` layout's main
-# block has a 704px content box and st.columns puts a 32px gap between the two,
-# so the right column is (704 - 32) / 4 = 168px.
+# Ceiling on bytes either remote fetch will pull into memory and cache. Governs
+# both the URL and the YouTube path (hence the name — it was MAX_URL_DOWNLOAD_BYTES
+# while only the URL path was capped). Distinct from server.maxUploadSize, which
+# bounds a per-file browser PUT that never enters these caches.
+MAX_DOWNLOAD_BYTES = 500 * 1024 * 1024
+# Shared width of every right-hand control: the language selectbox and the
+# Transcribe and Download buttons. It has to be an explicit number because
+# st.selectbox has no width="content" (its default is "stretch", which fills a
+# horizontal container); the two buttons take the same value so all three share
+# a right edge. Originally reverse-engineered from st.columns([3, 1]) — the
+# `centered` layout's main block has a 704px content box and st.columns puts a
+# 32px gap between the two columns, so the right column was (704 - 32) / 4 =
+# 168px — and kept at that value so the rendered layout is unchanged now that
+# the columns are gone.
 SELECT_WIDTH = 168
 PAGE_CONFIG: dict[str, Any] = {
     "page_title": "Whisper Transcribe",
@@ -58,7 +64,16 @@ class _RemoteAudio:
         return self._data
 
 
-@st.cache_data(show_spinner="Downloading audio from YouTube...", max_entries=5, ttl="1h")
+# cache_resource, not cache_data, and the deviation is deliberate: performance.md
+# scopes cache_resource to unserializable objects, and bytes are serializable. But
+# cache_data stores entries *pickled* and returns a fresh copy per call, so an
+# active entry costs three resident buffers — the pickled entry, a per-rerun
+# unpickled copy (these fetches re-invoke on every rerun while their tab is open),
+# and the MediaFileManager buffer backing the st.audio preview. cache_resource
+# hands back the same object and collapses the first two. Safe here only because
+# the return is a tuple of immutables: a shared mutable would be a cross-session
+# aliasing bug. Note _clear_caches must call st.cache_resource.clear() too.
+@st.cache_resource(show_spinner="Downloading audio from YouTube...", max_entries=5, ttl="1h")
 def _fetch_youtube_audio(url: str) -> tuple[bytes, str]:
     with tempfile.TemporaryDirectory() as tmpdir:
         ydl_opts = {
@@ -68,19 +83,31 @@ def _fetch_youtube_audio(url: str) -> tuple[bytes, str]:
             "no_warnings": True,
             "noplaylist": True,
             "restrictfilenames": True,
+            "max_filesize": MAX_DOWNLOAD_BYTES,
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             downloaded = Path(ydl.prepare_filename(info))
+        # Both halves are needed. `max_filesize` aborts the download early, but
+        # yt-dlp only consults it where a Content-Length is known (downloader/
+        # http.py, external.py) — no fragmented HLS/DASH downloader reads it at
+        # all, which is exactly the multi-hour livestream VOD this exists to
+        # stop. The stat() gate catches what slipped through: the file is
+        # already on disk, and what is being bounded is the slurp into one
+        # bytes object and the cache entry holding it, not the disk write.
+        if downloaded.stat().st_size > MAX_DOWNLOAD_BYTES:
+            raise RuntimeError(f"YouTube audio exceeds {MAX_DOWNLOAD_BYTES // (1024 * 1024)} MB")
         return downloaded.read_bytes(), downloaded.name
 
 
-@st.cache_data(show_spinner="Downloading audio from URL...", max_entries=5, ttl="1h")
+@st.cache_resource(
+    show_spinner="Downloading audio from URL...", max_entries=5, ttl="1h"
+)  # See above.
 def _fetch_url_audio(url: str) -> tuple[bytes, str]:
     with urlopen(url, timeout=60) as resp:
-        data = resp.read(MAX_URL_DOWNLOAD_BYTES + 1)
-    if len(data) > MAX_URL_DOWNLOAD_BYTES:
-        raise RuntimeError(f"URL response exceeds {MAX_URL_DOWNLOAD_BYTES // (1024 * 1024)} MB")
+        data = resp.read(MAX_DOWNLOAD_BYTES + 1)
+    if len(data) > MAX_DOWNLOAD_BYTES:
+        raise RuntimeError(f"URL response exceeds {MAX_DOWNLOAD_BYTES // (1024 * 1024)} MB")
     filename = unquote(Path(urlparse(url).path).name) or "download"
     return data, filename
 
@@ -212,7 +239,14 @@ def _handle_transcription(
     total = len(uploaded_files)
     with st.status(f"Transcribing {total} file(s)...", expanded=True) as status:
         for i, uploaded_file in enumerate(uploaded_files, start=1):
-            status.update(label=f"Transcribing {uploaded_file.name} ({i}/{total})...")
+            # Escape before interpolating anywhere Markdown renders. An st.status
+            # label takes the Markdown label subset — which includes images, so a
+            # filename carrying `![](https://host/x.png)` would fetch on *every*
+            # file, not just a failure — and st.error below renders full Markdown.
+            # Filenames are not trusted input: _fetch_url_audio percent-decodes
+            # them off the URL path, so `%5B`/`%28` arrive as live syntax.
+            name_md = _escape_markdown(uploaded_file.name)
+            status.update(label=f"Transcribing {name_md} ({i}/{total})...")
             name = Path(uploaded_file.name)
             try:
                 result = _transcribe(
@@ -239,9 +273,9 @@ def _handle_transcription(
                 # rebound rather than mutated.
                 st.session_state["transcription"] = transcriptions
             except RuntimeError as e:
-                st.error(f"Transcription failed for {uploaded_file.name}: {e}")
+                st.error(f"Transcription failed for {name_md}: {e}")
             except Exception as e:
-                st.error(f"Unexpected error for {uploaded_file.name}: {e}")
+                st.error(f"Unexpected error for {name_md}: {e}")
                 st.exception(e)
         status.update(
             label=f"Transcribed {len(transcriptions)}/{total} file(s)",
@@ -307,27 +341,48 @@ def _display_transcription() -> None:
             initial = _format_srt(data["result"])
         else:
             initial = data["result"]["text"].strip()
-        st.subheader(_escape_markdown(data["filename"]))
-        transcript = st.text_area(
-            "Transcript",
-            initial,
-            height=300,
-            label_visibility="collapsed",
-            key=f"transcript_b{batch}_{i}",
-        )
-        ext, mime = ("srt", "application/x-subrip") if include_subtitles else ("txt", "text/plain")
-        _, download_col = st.columns([3, 1])
-        with download_col:
-            st.download_button(
-                "Download",
-                transcript,
-                f"{data['file_stem']}.{ext}",
-                mime,
-                icon=":material/download:",
-                key=f"download_{ext}_b{batch}_{i}",
-                help="Downloads as .srt when subtitles are enabled, .txt otherwise.",
-                width="stretch",
+        # One bordered box per result. Sections stack flat otherwise, so in a
+        # multi-file batch one file's Download button abuts the next file's
+        # heading with nothing marking the seam. No-op visually for a single file.
+        with st.container(border=True):
+            st.subheader(_escape_markdown(data["filename"]))
+            transcript = st.text_area(
+                "Transcript",
+                initial,
+                height=300,
+                label_visibility="collapsed",
+                key=f"transcript_b{batch}_{i}",
             )
+            ext, mime = (
+                ("srt", "application/x-subrip") if include_subtitles else ("txt", "text/plain")
+            )
+            with st.container(horizontal=True, horizontal_alignment="right"):
+                st.download_button(
+                    "Download",
+                    transcript,
+                    f"{data['file_stem']}.{ext}",
+                    mime,
+                    icon=":material/download:",
+                    key=f"download_{ext}_b{batch}_{i}",
+                    # The second sentence is not padding. st.download_button
+                    # materializes non-callable `data` at *render* time and hands
+                    # the frontend a pre-baked URL, while st.text_area commits
+                    # only on blur or Ctrl/Cmd+Enter — so a click with an
+                    # uncommitted edit serves the previous text. Verified in real
+                    # Chrome: first click got the pre-edit string, second got the
+                    # edit. Not fixable in-app (st.form rejects download buttons,
+                    # and a deferred callable runs before the pending update
+                    # lands), so the tooltip is the mitigation.
+                    help=(
+                        "Downloads as .srt when subtitles are enabled, .txt otherwise. "
+                        "Commit an edit first — click outside the box or press "
+                        "Ctrl/Cmd+Enter — or the download will miss it."
+                    ),
+                    # Nothing here depends on a post-download rerun — the payload
+                    # is the text area's already-committed return value.
+                    on_click="ignore",
+                    width=SELECT_WIDTH,
+                )
 
 
 # UI
@@ -496,14 +551,13 @@ audio_sources = (
 # always shows its reason, even when the expander holding the input is collapsed.
 if time_range_error:
     st.error(time_range_error, icon=":material/error:")
-_, action_col = st.columns([3, 1])
-with action_col:
+with st.container(horizontal=True, horizontal_alignment="right"):
     transcribe_clicked = st.button(
         "Transcribe",
         icon=":material/graphic_eq:",
         type="primary",
         disabled=not audio_sources or bool(time_range_error),
-        width="stretch",
+        width=SELECT_WIDTH,
     )
 
 if transcribe_clicked and audio_sources and not time_range_error:
