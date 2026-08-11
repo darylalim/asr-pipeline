@@ -30,6 +30,35 @@ VIDEO_FORMATS = (
     "webm",
     "mkv",
 )
+# st.audio's `format` is not a hint. It is passed verbatim through
+# _marshall_av_media into MediaFileManager.add() with no sniffing anywhere, and
+# becomes both the Content-Type header the media route serves and the extension
+# in the /media/<hash>.<ext> URL. Its default is "audio/wav", so without this map
+# every preview — an .mp3 upload, a YouTube Opus stream — is advertised as WAV.
+# Chrome and Firefox sniff the container and play it anyway; browsers that trust
+# the declared type can refuse. Deliberately not mimetypes.guess_type: it maps
+# .m4a to the non-standard audio/mp4a-latm that browsers do not recognize, reads
+# a table that varies by platform, and returns None for the extensionless name
+# _fetch_url_audio falls back to. Covers more than AUDIO_FORMATS/VIDEO_FORMATS
+# because the YouTube and URL paths never consult those tuples.
+MEDIA_MIME_TYPES = {
+    "mp3": "audio/mpeg",
+    "m4a": "audio/mp4",
+    "wav": "audio/wav",
+    "opus": "audio/ogg",
+    "oga": "audio/ogg",
+    "ogg": "audio/ogg",
+    "flac": "audio/flac",
+    "aac": "audio/aac",
+    "mp4": "video/mp4",
+    "mov": "video/quicktime",
+    "webm": "video/webm",
+    "mkv": "video/x-matroska",
+}
+# Fallback for an unrecognized extension, including _fetch_url_audio's extensionless
+# "download". Must stay non-empty: the media route does `media_type=mimetype or
+# "text/plain"`, so an empty string would serve audio as text.
+DEFAULT_MEDIA_MIME = "audio/wav"
 LANGUAGE_CODES: list[str | None] = [None] + sorted(LANGUAGES, key=lambda c: LANGUAGES[c])
 YOUTUBE_URL_RE = re.compile(r"^https?://(www\.|m\.)?(youtube\.com/|youtu\.be/)", re.IGNORECASE)
 URL_RE = re.compile(r"^https?://", re.IGNORECASE)
@@ -110,6 +139,15 @@ def _fetch_url_audio(url: str) -> tuple[bytes, str]:
         raise RuntimeError(f"URL response exceeds {MAX_DOWNLOAD_BYTES // (1024 * 1024)} MB")
     filename = unquote(Path(urlparse(url).path).name) or "download"
     return data, filename
+
+
+def _media_mime(filename: str) -> str:
+    """Content-Type for an st.audio preview, derived from the filename's extension.
+
+    See MEDIA_MIME_TYPES for why st.audio's "audio/wav" default is not good enough
+    and why this is a hand-written map rather than mimetypes.guess_type.
+    """
+    return MEDIA_MIME_TYPES.get(Path(filename).suffix.lstrip(".").lower(), DEFAULT_MEDIA_MIME)
 
 
 def _format_language(code: str | None) -> str:
@@ -428,7 +466,7 @@ with upload_tab:
         accept_multiple_files=True,
     )
     for uploaded_file in uploaded_files:
-        st.audio(uploaded_file)
+        st.audio(uploaded_file, format=_media_mime(uploaded_file.name))
 
 with record_tab:
     recorded_audio = st.audio_input("Record audio", label_visibility="collapsed")
@@ -536,7 +574,7 @@ if youtube_tab.open and youtube_url and YOUTUBE_URL_RE.match(youtube_url):
         try:
             data, filename = _fetch_youtube_audio(youtube_url)
             youtube_audio = _RemoteAudio(filename, data)
-            st.audio(data)
+            st.audio(data, format=_media_mime(filename))
         except yt_dlp.utils.DownloadError as e:
             st.error(f"Could not download from YouTube: {e}", icon=":material/error:")
         except Exception as e:
@@ -552,7 +590,7 @@ if url_tab.open and file_url and URL_RE.match(file_url):
             try:
                 data, filename = _fetch_url_audio(file_url)
                 url_audio = _RemoteAudio(filename, data)
-                st.audio(data)
+                st.audio(data, format=_media_mime(filename))
             except (URLError, RuntimeError) as e:
                 st.error(f"Could not download from URL: {e}", icon=":material/error:")
             except Exception as e:

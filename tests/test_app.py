@@ -20,6 +20,7 @@ from streamlit_app import (
     _format_srt,
     _format_timestamp,
     _handle_transcription,
+    _media_mime,
     _RemoteAudio,
     _transcribe,
     _transcription_kwargs,
@@ -829,6 +830,42 @@ def test_format_srt_escapes_arrow():
 
 
 @pytest.mark.parametrize(
+    "filename,expected",
+    [
+        ("interview.mp3", "audio/mpeg"),
+        ("interview.m4a", "audio/mp4"),
+        ("interview.wav", "audio/wav"),
+        ("interview.opus", "audio/ogg"),
+        ("clip.mp4", "video/mp4"),
+        ("clip.mkv", "video/x-matroska"),
+        ("SHOUTING.MP3", "audio/mpeg"),
+        ("archive.flac", "audio/flac"),
+        # Neither is in AUDIO_FORMATS/VIDEO_FORMATS, and both are reachable: the
+        # YouTube and URL fetches never consult those tuples, and _fetch_url_audio
+        # falls back to the extensionless "download" for an empty URL path.
+        ("mystery.xyz", "audio/wav"),
+        ("download", "audio/wav"),
+    ],
+    ids=[
+        "mp3",
+        "m4a",
+        "wav",
+        "opus",
+        "mp4",
+        "mkv",
+        "uppercase",
+        "not_in_upload_formats",
+        "unknown_extension",
+        "no_extension",
+    ],
+)
+def test_media_mime(filename, expected):
+    # st.audio's format= default is "audio/wav" for every input, and it becomes the
+    # served Content-Type and the media URL's extension — not a hint.
+    assert _media_mime(filename) == expected
+
+
+@pytest.mark.parametrize(
     "raw,expected",
     [
         ("interview.mp3", "interview.mp3"),
@@ -1107,6 +1144,34 @@ def test_youtube_preview_renders_inside_its_tab(tmp_path):
     assert not at.exception
     assert len(_tab(at, YOUTUBE_TAB).get("audio")) == 1
     assert _tab(at, UPLOAD_TAB).get("audio") == []
+
+
+# st.audio's `format` is not a hint -- it becomes the media file's Content-Type
+# *and* the extension in its /media/<hash>.<ext> URL, so that URL is an
+# observable proxy for the argument. These pin the *wiring*: test_media_mime
+# covers the helper, but with format= dropped from the call sites the helper
+# tests still pass and every preview is silently served as .wav again.
+
+
+def test_url_preview_declares_the_source_mime():
+    with patch("urllib.request.urlopen") as mock_urlopen:
+        _stub_urlopen(mock_urlopen, b"file bytes")
+        at = _type_url("Audio/video file URL", "https://example.com/audio.mp3", URL_TAB)
+    assert not at.exception
+    assert _tab(at, URL_TAB).get("audio")[0].proto.url.endswith(".mp3")
+
+
+def test_youtube_preview_declares_the_source_mime(tmp_path):
+    fake_file = tmp_path / "Clip.m4a"
+    fake_file.write_bytes(b"yt bytes")
+    with patch("yt_dlp.YoutubeDL") as mock_ydl_cls:
+        ydl = MagicMock()
+        ydl.extract_info.return_value = {"title": "Clip"}
+        ydl.prepare_filename.return_value = str(fake_file)
+        mock_ydl_cls.return_value.__enter__.return_value = ydl
+        at = _type_url("YouTube URL", "https://youtube.com/watch?v=mime", YOUTUBE_TAB)
+    assert not at.exception
+    assert _tab(at, YOUTUBE_TAB).get("audio")[0].proto.url.endswith(".m4a")
 
 
 def test_active_remote_tab_enables_transcribe():
