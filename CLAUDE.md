@@ -208,6 +208,7 @@ pipeline ships no `remark-breaks`, so a single `\n` collapses to a space rather 
 
 - `RuntimeError` caught explicitly for transcription failures
 - Unexpected exceptions shown with `st.exception()`
+- **All seven `st.error` calls carry `icon=":material/error:"`.** `st.error` has no default icon — its docstring is explicit that "if no leading icon is found, no icon is displayed", and the leading-emoji extraction it *does* perform never fires here because every body starts with a word. So an omission is a real visual difference, not a no-op, and six of the seven used to render as a bare box while the time-range validation error alone got a glyph. Adding one to the two calls inside `_handle_transcription` costs four exact-match `mock_st.error.assert_called_once_with(...)` updates in `tests/test_app.py`; the four module-level calls in the fetch `try`/`except` blocks have no assertions on their error text
 
 ### Testing
 

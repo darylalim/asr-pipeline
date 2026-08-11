@@ -273,9 +273,9 @@ def _handle_transcription(
                 # rebound rather than mutated.
                 st.session_state["transcription"] = transcriptions
             except RuntimeError as e:
-                st.error(f"Transcription failed for {name_md}: {e}")
+                st.error(f"Transcription failed for {name_md}: {e}", icon=":material/error:")
             except Exception as e:
-                st.error(f"Unexpected error for {name_md}: {e}")
+                st.error(f"Unexpected error for {name_md}: {e}", icon=":material/error:")
                 st.exception(e)
         status.update(
             label=f"Transcribed {len(transcriptions)}/{total} file(s)",
@@ -520,9 +520,9 @@ if youtube_tab.open and youtube_url and YOUTUBE_URL_RE.match(youtube_url):
             youtube_audio = _RemoteAudio(filename, data)
             st.audio(data)
         except yt_dlp.utils.DownloadError as e:
-            st.error(f"Could not download from YouTube: {e}")
+            st.error(f"Could not download from YouTube: {e}", icon=":material/error:")
         except Exception as e:
-            st.error(f"Unexpected error: {e}")
+            st.error(f"Unexpected error: {e}", icon=":material/error:")
             st.exception(e)
 
 url_audio: _RemoteAudio | None = None
@@ -536,9 +536,9 @@ if url_tab.open and file_url and URL_RE.match(file_url):
                 url_audio = _RemoteAudio(filename, data)
                 st.audio(data)
             except (URLError, RuntimeError) as e:
-                st.error(f"Could not download from URL: {e}")
+                st.error(f"Could not download from URL: {e}", icon=":material/error:")
             except Exception as e:
-                st.error(f"Unexpected error: {e}")
+                st.error(f"Unexpected error: {e}", icon=":material/error:")
                 st.exception(e)
 
 audio_sources = (

@@ -418,7 +418,8 @@ def test_handle_transcription_runtime_error(mock_transcribe, mock_st, mock_uploa
         [mock_uploaded_file], language=None, task="transcribe", include_subtitles=False
     )
     mock_st.error.assert_called_once_with(
-        "Transcription failed for interview.mp3: Transcription produced no text"
+        "Transcription failed for interview.mp3: Transcription produced no text",
+        icon=":material/error:",
     )
     assert mock_st.session_state["transcription"] == []
 
@@ -428,7 +429,9 @@ def test_handle_transcription_unexpected_error(mock_transcribe, mock_st, mock_up
     _handle_transcription(
         [mock_uploaded_file], language=None, task="transcribe", include_subtitles=False
     )
-    mock_st.error.assert_called_once_with("Unexpected error for interview.mp3: unexpected")
+    mock_st.error.assert_called_once_with(
+        "Unexpected error for interview.mp3: unexpected", icon=":material/error:"
+    )
     mock_st.exception.assert_called_once()
 
 
@@ -448,7 +451,7 @@ def test_handle_transcription_escapes_filename_in_error(error, expected, mock_st
             [_make_file(name="my_song [live].mp3")], **_handle_transcription_kwargs()
         )
 
-    mock_st.error.assert_called_once_with(expected)
+    mock_st.error.assert_called_once_with(expected, icon=":material/error:")
 
 
 @patch("streamlit_app._transcribe", return_value=MOCK_WHISPER_RESULT)
@@ -522,7 +525,8 @@ def test_handle_transcription_partial_failure(mock_transcribe, mock_st):
     assert transcriptions[0]["filename"] == "first.mp3"
     assert transcriptions[1]["filename"] == "third.mp3"
     mock_st.error.assert_called_once_with(
-        "Transcription failed for second.mp3: Transcription produced no text"
+        "Transcription failed for second.mp3: Transcription produced no text",
+        icon=":material/error:",
     )
 
 
