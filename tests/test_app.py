@@ -4,17 +4,21 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 import streamlit as st
 from streamlit.proto.Common_pb2 import FileURLs
+from streamlit.runtime.memory_media_file_storage import get_extension_for_mimetype
 from streamlit.runtime.uploaded_file_manager import UploadedFile, UploadedFileRec
 from streamlit.testing.v1 import AppTest
 
 from streamlit_app import (
     ASR_MODEL_REPO,
     AUDIO_FORMATS,
+    DEFAULT_MEDIA_MIME,
+    ERROR_ICON,
     MAX_DOWNLOAD_BYTES,
     PAGE_CONFIG,
     SELECT_WIDTH,
     VIDEO_FORMATS,
     _display_transcription,
+    _error,
     _escape_markdown,
     _fetch_url_audio,
     _fetch_youtube_audio,
@@ -75,18 +79,37 @@ def _make_file(name="interview.mp3", data=b"fake audio bytes"):
     return f
 
 
-def _stub_urlopen(mock_urlopen, data):
+def _stub_urlopen(mock_urlopen, data, content_type=None):
     response = MagicMock()
     response.read.return_value = data
+    # A real dict, not a MagicMock: _fetch_url_audio does headers.get(...) and then
+    # string-tests the result, and every string method on a MagicMock returns a
+    # truthy MagicMock -- so a mocked header would silently take the "trust the
+    # server" branch and hand st.audio a MagicMock as its format.
+    response.headers = {} if content_type is None else {"Content-Type": content_type}
     mock_urlopen.return_value.__enter__.return_value = response
     return response
 
 
-def _stub_ytdlp(mock_yt_dlp, path, title="Test"):
+def _ydl_info(title="Test", **extra):
+    return {"title": title, **extra}
+
+
+def _stub_ytdlp(mock_yt_dlp, path, title="Test", **info):
+    return _stub_ytdlp_class(mock_yt_dlp.YoutubeDL, path, title, **info)
+
+
+def _stub_ytdlp_class(mock_ydl_cls, path, title="Test", **info):
+    """Stub a patched yt_dlp.YoutubeDL *class*.
+
+    _stub_ytdlp patches `streamlit_app.yt_dlp`, which the AppTest cases cannot use
+    -- AppTest re-executes the script each run and rebinds its imports, so those
+    patch `yt_dlp.YoutubeDL` directly and call this instead.
+    """
     ydl = MagicMock()
-    ydl.extract_info.return_value = {"title": title}
+    ydl.extract_info.return_value = _ydl_info(title, **info)
     ydl.prepare_filename.return_value = str(path)
-    mock_yt_dlp.YoutubeDL.return_value.__enter__.return_value = ydl
+    mock_ydl_cls.return_value.__enter__.return_value = ydl
     return ydl
 
 
@@ -228,10 +251,11 @@ def test_fetch_youtube_audio_returns_bytes_and_filename(mock_yt_dlp, tmp_path):
     fake_file.write_bytes(b"fake youtube audio")
     ydl = _stub_ytdlp(mock_yt_dlp, fake_file, title="Test Video")
 
-    data, filename = _fetch_youtube_audio("https://youtube.com/watch?v=fetch_bytes")
+    data, filename, mime = _fetch_youtube_audio("https://youtube.com/watch?v=fetch_bytes")
 
     assert data == b"fake youtube audio"
     assert filename == "Test_Video.m4a"
+    assert mime == "audio/mp4"
     ydl.extract_info.assert_called_once_with(
         "https://youtube.com/watch?v=fetch_bytes",
         download=True,
@@ -257,10 +281,11 @@ def test_fetch_youtube_audio_uses_safe_options(mock_yt_dlp, tmp_path):
 def test_fetch_url_audio_returns_bytes_and_filename(mock_urlopen):
     _stub_urlopen(mock_urlopen, b"file bytes")
 
-    data, filename = _fetch_url_audio("https://example.com/audio.mp3")
+    data, filename, mime = _fetch_url_audio("https://example.com/audio.mp3")
 
     assert data == b"file bytes"
     assert filename == "audio.mp3"
+    assert mime == "audio/mpeg"
     mock_urlopen.assert_called_once_with("https://example.com/audio.mp3", timeout=60)
 
 
@@ -276,8 +301,73 @@ def test_fetch_url_audio_returns_bytes_and_filename(mock_urlopen):
 @patch("streamlit_app.urlopen")
 def test_fetch_url_audio_filename(mock_urlopen, url, expected_filename):
     _stub_urlopen(mock_urlopen, b"bytes")
-    _, filename = _fetch_url_audio(url)
+    _, filename, _ = _fetch_url_audio(url)
     assert filename == expected_filename
+
+
+@pytest.mark.parametrize(
+    "content_type,url,expected",
+    [
+        ("audio/flac", "https://example.com/track.mp3", "audio/flac"),
+        ("audio/mpeg; charset=binary", "https://example.com/x", "audio/mpeg"),
+        ("VIDEO/MP4", "https://example.com/x", "video/mp4"),
+        # The extension map cannot see a content-negotiated URL or an
+        # extensionless redirect target -- exactly where it would answer
+        # audio/wav, the mis-declaration this whole mechanism exists to avoid.
+        ("audio/ogg", "https://example.com/stream?id=42", "audio/ogg"),
+        # Untrustworthy declarations fall back to the extension. A server that
+        # answers with an HTML error page or a generic blob must not get to set
+        # the declared type of an <audio> element.
+        ("text/html", "https://example.com/track.mp3", "audio/mpeg"),
+        ("application/octet-stream", "https://example.com/track.m4a", "audio/mp4"),
+        (None, "https://example.com/track.opus", "audio/ogg"),
+        (None, "https://example.com/", "audio/wav"),
+    ],
+    ids=[
+        "server_overrides_extension",
+        "strips_parameters",
+        "case_insensitive",
+        "no_extension_to_guess",
+        "rejects_html",
+        "rejects_octet_stream",
+        "absent_header",
+        "absent_header_and_extension",
+    ],
+)
+@patch("streamlit_app.urlopen")
+def test_fetch_url_audio_prefers_the_served_content_type(mock_urlopen, content_type, url, expected):
+    _stub_urlopen(mock_urlopen, b"bytes", content_type=content_type)
+    _, _, mime = _fetch_url_audio(url)
+    assert mime == expected
+
+
+@patch("streamlit_app.yt_dlp")
+def test_fetch_youtube_audio_declares_audio_only_containers(mock_yt_dlp, tmp_path):
+    # bestaudio yields Opus in a WebM container with no video track. The extension
+    # alone says video/webm, which is the same mis-declaration on an <audio>
+    # element that audio/wav-for-everything was; `info` carries the codecs.
+    fake_file = tmp_path / "Clip.webm"
+    fake_file.write_bytes(b"opus bytes")
+    _stub_ytdlp(mock_yt_dlp, fake_file, title="Clip", vcodec="none", acodec="opus")
+
+    _, _, mime = _fetch_youtube_audio("https://youtube.com/watch?v=audio_only")
+
+    assert mime == "audio/webm"
+
+
+@patch("streamlit_app.yt_dlp")
+def test_fetch_youtube_audio_keeps_the_container_type_when_a_video_track_exists(
+    mock_yt_dlp, tmp_path
+):
+    # The `best` half of "bestaudio/best" can select a muxed stream, and an
+    # unknown selection (no vcodec key) must not be assumed audio-only either.
+    fake_file = tmp_path / "Clip.webm"
+    fake_file.write_bytes(b"muxed bytes")
+    _stub_ytdlp(mock_yt_dlp, fake_file, title="Clip", vcodec="vp9", acodec="opus")
+
+    _, _, mime = _fetch_youtube_audio("https://youtube.com/watch?v=muxed")
+
+    assert mime == "video/webm"
 
 
 @patch("streamlit_app.MAX_DOWNLOAD_BYTES", 10)
@@ -420,8 +510,10 @@ def test_handle_transcription_runtime_error(mock_transcribe, mock_st, mock_uploa
     _handle_transcription(
         [mock_uploaded_file], language=None, task="transcribe", include_subtitles=False
     )
+    # `\:` renders as a plain colon. _error escapes the whole message rather than
+    # only the untrusted spans, so the fixed literals pick up backslashes too.
     mock_st.error.assert_called_once_with(
-        "Transcription failed for interview.mp3: Transcription produced no text",
+        r"Transcription failed for interview.mp3\: Transcription produced no text",
         icon=":material/error:",
     )
     assert mock_st.session_state["transcription"] == []
@@ -433,7 +525,7 @@ def test_handle_transcription_unexpected_error(mock_transcribe, mock_st, mock_up
         [mock_uploaded_file], language=None, task="transcribe", include_subtitles=False
     )
     mock_st.error.assert_called_once_with(
-        "Unexpected error for interview.mp3: unexpected", icon=":material/error:"
+        r"Unexpected error for interview.mp3\: unexpected", icon=":material/error:"
     )
     mock_st.exception.assert_called_once()
 
@@ -441,8 +533,8 @@ def test_handle_transcription_unexpected_error(mock_transcribe, mock_st, mock_up
 @pytest.mark.parametrize(
     "error,expected",
     [
-        (RuntimeError("boom"), r"Transcription failed for my\_song \[live\].mp3: boom"),
-        (ValueError("boom"), r"Unexpected error for my\_song \[live\].mp3: boom"),
+        (RuntimeError("boom"), r"Transcription failed for my\_song \[live\].mp3\: boom"),
+        (ValueError("boom"), r"Unexpected error for my\_song \[live\].mp3\: boom"),
     ],
 )
 def test_handle_transcription_escapes_filename_in_error(error, expected, mock_st):
@@ -466,6 +558,36 @@ def test_handle_transcription_escapes_filename_in_status_label(mock_transcribe, 
 
     status = mock_st.status.return_value.__enter__.return_value
     status.update.assert_any_call(label=r"Transcribing clip \[1\].mp3 (1/1)...")
+
+
+@pytest.mark.parametrize(
+    "message,expected",
+    [
+        (
+            "Could not download from YouTube: Unsupported URL: "
+            "https://youtu.be/![](https://attacker.example/p.png)",
+            # `(` and `)` are deliberately not in the class and do not need to be:
+            # an image needs the bracket half, and `[`/`]` are escaped, so the
+            # parenthesized destination is inert on its own.
+            r"Could not download from YouTube\: Unsupported URL\: "
+            r"https\://youtu.be/!\[\](https\://attacker.example/p.png)",
+        ),
+        ("Invalid time range: '![](https://x/p.png)' is not a number.", None),
+    ],
+    ids=["fetch_exception", "validation_message"],
+)
+def test_error_escapes_the_whole_message(mock_st, message, expected):
+    # The exception text is untrusted, not just the filename: yt-dlp's
+    # UnsupportedError is literally f"Unsupported URL: {url}" and YOUTUBE_URL_RE is
+    # prefix-anchored, so a crafted URL reaches the alert body verbatim -- and
+    # st.error's body renders full Markdown, so `![](...)` fires a request.
+    _error(message)
+
+    (rendered,), kwargs = mock_st.error.call_args
+    assert kwargs == {"icon": ERROR_ICON}
+    assert "![](" not in rendered
+    if expected is not None:
+        assert rendered == expected
 
 
 def test_handle_transcription_rewinds_the_cursor_before_reading(mock_st):
@@ -500,7 +622,7 @@ def test_handle_transcription_collapses_whitespace_in_filename(mock_st):
     # start is what defuses them, so they survive as literal characters.
     (message,), kwargs = mock_st.error.call_args
     assert "\n" not in message
-    assert message == "Transcription failed for clip # Big > quote.mp3: boom"
+    assert message == r"Transcription failed for clip # Big > quote.mp3\: boom"
     assert kwargs == {"icon": ":material/error:"}
 
 
@@ -564,7 +686,7 @@ def test_handle_transcription_partial_failure(mock_transcribe, mock_st):
     assert transcriptions[0]["filename"] == "first.mp3"
     assert transcriptions[1]["filename"] == "third.mp3"
     mock_st.error.assert_called_once_with(
-        "Transcription failed for second.mp3: Transcription produced no text",
+        r"Transcription failed for second.mp3\: Transcription produced no text",
         icon=":material/error:",
     )
 
@@ -1151,10 +1273,7 @@ def test_youtube_fetch_gated_on_tab_visibility(active_tab, expected_calls, tmp_p
     fake_file = tmp_path / "Clip.m4a"
     fake_file.write_bytes(b"yt bytes")
     with patch("yt_dlp.YoutubeDL") as mock_ydl_cls:
-        ydl = MagicMock()
-        ydl.extract_info.return_value = {"title": "Clip"}
-        ydl.prepare_filename.return_value = str(fake_file)
-        mock_ydl_cls.return_value.__enter__.return_value = ydl
+        ydl = _stub_ytdlp_class(mock_ydl_cls, fake_file, "Clip")
         at = _type_url("YouTube URL", url, active_tab)
     assert not at.exception
     assert ydl.extract_info.call_count == expected_calls
@@ -1172,6 +1291,21 @@ def _tab(at, label):
 # bottom of the page, under the Transcribe button.
 
 
+def _assert_declared_mime(element, mime):
+    """Assert an st.audio element was given `format=mime`, via its media URL.
+
+    The mimetype is not in the proto, but Streamlit derives the URL's extension
+    from it, so the suffix is the only observable proxy. Both sides are computed
+    with Streamlit's own lookup rather than hardcoded, because that lookup is
+    `mimetypes.guess_extension` -- the same platform-varying table MEDIA_MIME_TYPES
+    exists to avoid. The inequality guard keeps the assertion from passing
+    vacuously if a host's tables map both types to the same (or an empty) suffix.
+    """
+    expected = get_extension_for_mimetype(mime)
+    assert expected and expected != get_extension_for_mimetype(DEFAULT_MEDIA_MIME)
+    assert element.proto.url.endswith(expected)
+
+
 def test_url_preview_renders_inside_its_tab():
     with patch("urllib.request.urlopen") as mock_urlopen:
         _stub_urlopen(mock_urlopen, b"file bytes")
@@ -1179,48 +1313,22 @@ def test_url_preview_renders_inside_its_tab():
     assert not at.exception
     assert len(_tab(at, URL_TAB).get("audio")) == 1
     assert _tab(at, UPLOAD_TAB).get("audio") == []
+    # Also pins the format= wiring: test_media_mime and the _fetch_* tests cover
+    # which mimetype is chosen, but only a rendered element shows it was passed.
+    # Dropping format= from the call site serves every preview as .wav again.
+    _assert_declared_mime(_tab(at, URL_TAB).get("audio")[0], "audio/mpeg")
 
 
 def test_youtube_preview_renders_inside_its_tab(tmp_path):
     fake_file = tmp_path / "Clip.m4a"
     fake_file.write_bytes(b"yt bytes")
     with patch("yt_dlp.YoutubeDL") as mock_ydl_cls:
-        ydl = MagicMock()
-        ydl.extract_info.return_value = {"title": "Clip"}
-        ydl.prepare_filename.return_value = str(fake_file)
-        mock_ydl_cls.return_value.__enter__.return_value = ydl
+        _stub_ytdlp_class(mock_ydl_cls, fake_file, "Clip")
         at = _type_url("YouTube URL", "https://youtube.com/watch?v=slot", YOUTUBE_TAB)
     assert not at.exception
     assert len(_tab(at, YOUTUBE_TAB).get("audio")) == 1
     assert _tab(at, UPLOAD_TAB).get("audio") == []
-
-
-# st.audio's `format` is not a hint -- it becomes the media file's Content-Type
-# *and* the extension in its /media/<hash>.<ext> URL, so that URL is an
-# observable proxy for the argument. These pin the *wiring*: test_media_mime
-# covers the helper, but with format= dropped from the call sites the helper
-# tests still pass and every preview is silently served as .wav again.
-
-
-def test_url_preview_declares_the_source_mime():
-    with patch("urllib.request.urlopen") as mock_urlopen:
-        _stub_urlopen(mock_urlopen, b"file bytes")
-        at = _type_url("Audio/video file URL", "https://example.com/audio.mp3", URL_TAB)
-    assert not at.exception
-    assert _tab(at, URL_TAB).get("audio")[0].proto.url.endswith(".mp3")
-
-
-def test_youtube_preview_declares_the_source_mime(tmp_path):
-    fake_file = tmp_path / "Clip.m4a"
-    fake_file.write_bytes(b"yt bytes")
-    with patch("yt_dlp.YoutubeDL") as mock_ydl_cls:
-        ydl = MagicMock()
-        ydl.extract_info.return_value = {"title": "Clip"}
-        ydl.prepare_filename.return_value = str(fake_file)
-        mock_ydl_cls.return_value.__enter__.return_value = ydl
-        at = _type_url("YouTube URL", "https://youtube.com/watch?v=mime", YOUTUBE_TAB)
-    assert not at.exception
-    assert _tab(at, YOUTUBE_TAB).get("audio")[0].proto.url.endswith(".m4a")
+    _assert_declared_mime(_tab(at, YOUTUBE_TAB).get("audio")[0], "audio/mp4")
 
 
 def test_active_remote_tab_enables_transcribe():

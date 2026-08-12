@@ -55,10 +55,21 @@ MEDIA_MIME_TYPES = {
     "webm": "video/webm",
     "mkv": "video/x-matroska",
 }
+# A container extension names the container, not its contents. yt-dlp's
+# `bestaudio` yields audio-only .webm (Opus) and .m4a/.mp4 (AAC), and declaring
+# video/webm on an <audio> element is the same mis-declaration MEDIA_MIME_TYPES
+# exists to prevent — so a caller that *knows* there is no video track says so
+# and gets the audio/* sibling. Only the two containers bestaudio actually
+# produces are listed; .mkv/.mov audio-only does not occur on these paths.
+AUDIO_ONLY_MIME_TYPES = {
+    "video/webm": "audio/webm",
+    "video/mp4": "audio/mp4",
+}
 # Fallback for an unrecognized extension, including _fetch_url_audio's extensionless
 # "download". Must stay non-empty: the media route does `media_type=mimetype or
 # "text/plain"`, so an empty string would serve audio as text.
 DEFAULT_MEDIA_MIME = "audio/wav"
+ERROR_ICON = ":material/error:"
 LANGUAGE_CODES: list[str | None] = [None] + sorted(LANGUAGES, key=lambda c: LANGUAGES[c])
 YOUTUBE_URL_RE = re.compile(r"^https?://(www\.|m\.)?(youtube\.com/|youtu\.be/)", re.IGNORECASE)
 URL_RE = re.compile(r"^https?://", re.IGNORECASE)
@@ -109,7 +120,7 @@ class _RemoteAudio:
 # the return is a tuple of immutables: a shared mutable would be a cross-session
 # aliasing bug. Note _clear_caches must call st.cache_resource.clear() too.
 @st.cache_resource(show_spinner="Downloading audio from YouTube...", max_entries=5, ttl="1h")
-def _fetch_youtube_audio(url: str) -> tuple[bytes, str]:
+def _fetch_youtube_audio(url: str) -> tuple[bytes, str, str]:
     with tempfile.TemporaryDirectory() as tmpdir:
         ydl_opts = {
             "format": "bestaudio/best",
@@ -132,28 +143,57 @@ def _fetch_youtube_audio(url: str) -> tuple[bytes, str]:
         # bytes object and the cache entry holding it, not the disk write.
         if downloaded.stat().st_size > MAX_DOWNLOAD_BYTES:
             raise RuntimeError(f"YouTube audio exceeds {MAX_DOWNLOAD_BYTES // (1024 * 1024)} MB")
-        return downloaded.read_bytes(), downloaded.name
+        # The extension alone cannot tell an audio-only WebM from a video one, but
+        # `info` can: with format="bestaudio/best" yt-dlp reports the selected
+        # stream's codecs, so vcodec == "none" means there is no video track. A
+        # missing key falls back to the container's own type, which is what an
+        # unknown/merged selection deserves.
+        audio_only = info.get("vcodec") == "none"
+        return (
+            downloaded.read_bytes(),
+            downloaded.name,
+            _media_mime(downloaded.name, audio_only=audio_only),
+        )
 
 
 @st.cache_resource(
     show_spinner="Downloading audio from URL...", max_entries=5, ttl="1h"
 )  # See above.
-def _fetch_url_audio(url: str) -> tuple[bytes, str]:
+def _fetch_url_audio(url: str) -> tuple[bytes, str, str]:
     with urlopen(url, timeout=60) as resp:
         data = resp.read(MAX_DOWNLOAD_BYTES + 1)
+        declared = resp.headers.get("Content-Type", "")
     if len(data) > MAX_DOWNLOAD_BYTES:
         raise RuntimeError(f"URL response exceeds {MAX_DOWNLOAD_BYTES // (1024 * 1024)} MB")
     filename = unquote(Path(urlparse(url).path).name) or "download"
-    return data, filename
+    return data, filename, _url_mime(declared, filename)
 
 
-def _media_mime(filename: str) -> str:
+def _url_mime(declared: str, filename: str) -> str:
+    """Prefer the server's own Content-Type, falling back to the extension map.
+
+    The header is authoritative and covers what an extension cannot see: a
+    content-negotiated or query-driven URL, a redirect target with no extension,
+    and the extensionless "download" fallback — all of which the map can only
+    answer with DEFAULT_MEDIA_MIME, i.e. the very audio/wav mis-declaration
+    _media_mime exists to avoid. Only audio/* and video/* are trusted, though: a
+    server that answers text/html (an error page) or application/octet-stream
+    must not get to set the declared type of an <audio> element.
+    """
+    mime = declared.split(";")[0].strip().lower()
+    return mime if mime.startswith(("audio/", "video/")) else _media_mime(filename)
+
+
+def _media_mime(filename: str, *, audio_only: bool = False) -> str:
     """Content-Type for an st.audio preview, derived from the filename's extension.
 
     See MEDIA_MIME_TYPES for why st.audio's "audio/wav" default is not good enough
-    and why this is a hand-written map rather than mimetypes.guess_type.
+    and why this is a hand-written map rather than mimetypes.guess_type. Pass
+    audio_only=True when the caller knows the container holds no video track — see
+    AUDIO_ONLY_MIME_TYPES.
     """
-    return MEDIA_MIME_TYPES.get(Path(filename).suffix.lstrip(".").lower(), DEFAULT_MEDIA_MIME)
+    mime = MEDIA_MIME_TYPES.get(Path(filename).suffix.lstrip(".").lower(), DEFAULT_MEDIA_MIME)
+    return AUDIO_ONLY_MIME_TYPES.get(mime, mime) if audio_only else mime
 
 
 def _format_language(code: str | None) -> str:
@@ -212,6 +252,26 @@ def _escape_markdown(text: str) -> str:
       disallowedElements, so everything after the first newline is full Markdown.
     """
     return _MARKDOWN_ESCAPE_RE.sub(r"\\\1", " ".join(text.split()))
+
+
+def _error(message: str) -> None:
+    """Render an error alert with the app's icon, as literal text.
+
+    The *whole* message is escaped, so callers pass raw text — filenames, URLs,
+    exception strings — and never escape at the interpolation site. Escaping the
+    fixed literals along with them is harmless: `:` becomes `\\:`, which renders
+    as a colon.
+
+    Both halves matter. st.error's body is one of the two sinks Streamlit renders
+    without the frontend's isLabel flag (see _escape_markdown), and the exception
+    text reaching it is untrusted: yt-dlp's UnsupportedError is literally
+    f"Unsupported URL: {url}" and YOUTUBE_URL_RE is prefix-anchored, so a pasted
+    `https://youtu.be/![](https://host/p.png)` arrives verbatim and would fire an
+    outbound request. _validate_time_range likewise echoes the raw input back.
+    Routing every call through here also makes the icon structural instead of a
+    literal repeated at seven call sites, where a new one renders a bare box.
+    """
+    st.error(_escape_markdown(message), icon=ERROR_ICON)
 
 
 def _validate_time_range(raw: str) -> str | None:
@@ -350,9 +410,9 @@ def _handle_transcription(
                 # rebound rather than mutated.
                 st.session_state["transcription"] = transcriptions
             except RuntimeError as e:
-                st.error(f"Transcription failed for {name_md}: {e}", icon=":material/error:")
+                _error(f"Transcription failed for {uploaded_file.name}: {e}")
             except Exception as e:
-                st.error(f"Unexpected error for {name_md}: {e}", icon=":material/error:")
+                _error(f"Unexpected error for {uploaded_file.name}: {e}")
                 st.exception(e)
         status.update(
             label=f"Transcribed {len(transcriptions)}/{total} file(s)",
@@ -596,13 +656,13 @@ youtube_audio: _RemoteAudio | None = None
 if youtube_tab.open and youtube_url and YOUTUBE_URL_RE.match(youtube_url):
     with youtube_slot:
         try:
-            data, filename = _fetch_youtube_audio(youtube_url)
+            data, filename, mime = _fetch_youtube_audio(youtube_url)
             youtube_audio = _RemoteAudio(filename, data)
-            st.audio(data, format=_media_mime(filename))
+            st.audio(data, format=mime)
         except yt_dlp.utils.DownloadError as e:
-            st.error(f"Could not download from YouTube: {e}", icon=":material/error:")
+            _error(f"Could not download from YouTube: {e}")
         except Exception as e:
-            st.error(f"Unexpected error: {e}", icon=":material/error:")
+            _error(f"Unexpected error: {e}")
             st.exception(e)
 
 url_audio: _RemoteAudio | None = None
@@ -612,13 +672,13 @@ if url_tab.open and file_url and URL_RE.match(file_url):
             st.info("This looks like a YouTube URL — use the YouTube tab.")
         else:
             try:
-                data, filename = _fetch_url_audio(file_url)
+                data, filename, mime = _fetch_url_audio(file_url)
                 url_audio = _RemoteAudio(filename, data)
-                st.audio(data, format=_media_mime(filename))
+                st.audio(data, format=mime)
             except (URLError, RuntimeError) as e:
-                st.error(f"Could not download from URL: {e}", icon=":material/error:")
+                _error(f"Could not download from URL: {e}")
             except Exception as e:
-                st.error(f"Unexpected error: {e}", icon=":material/error:")
+                _error(f"Unexpected error: {e}")
                 st.exception(e)
 
 audio_sources = (
@@ -630,7 +690,7 @@ audio_sources = (
 # Render outside the Advanced options expander so a disabled Transcribe button
 # always shows its reason, even when the expander holding the input is collapsed.
 if time_range_error:
-    st.error(time_range_error, icon=":material/error:")
+    _error(time_range_error)
 with st.container(horizontal=True, horizontal_alignment="right"):
     transcribe_clicked = st.button(
         "Transcribe",
