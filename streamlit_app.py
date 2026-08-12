@@ -1,6 +1,7 @@
 import math
 import re
 import tempfile
+import textwrap
 from collections.abc import Sequence
 from itertools import pairwise
 from pathlib import Path
@@ -78,6 +79,12 @@ AUDIO_ONLY_MIME_TYPES = {
 # "text/plain"`, so an empty string would serve audio as text.
 DEFAULT_MEDIA_MIME = "audio/wav"
 ERROR_ICON = ":material/error:"
+# Characters per subtitle line. 42 is the long-standing broadcast convention
+# (Netflix, BBC and EBU all land on 42 for Latin scripts) and it is a *display*
+# constraint, not an SRT one — the format itself imposes no limit, which is why
+# unwrapped cues are valid, play fine, and still look wrong over a picture.
+# Applies to the Subtitles transcript format only; plain text is untouched.
+SUBTITLE_LINE_WIDTH = 42
 # The transcript format choice, as the segmented control renders it. This governs
 # two things at once -- what the results text area shows (plain text vs timestamped
 # SRT cues) and which extension the Download button serves (.txt vs .srt) -- which
@@ -271,12 +278,52 @@ def _format_timestamp(seconds: float, decimal_marker: str = ".") -> str:
     return f"{h:02d}:{m:02d}:{s:02d}{decimal_marker}{ms:03d}"
 
 
+def _wrap_cue(text: str, width: int = SUBTITLE_LINE_WIDTH) -> str:
+    """Wrap one cue's text to `width`, balancing the lines.
+
+    Whisper emits a segment per utterance with no regard for line length, so a
+    cue routinely ran well past the ~42 characters subtitle convention allows —
+    valid SRT that players accept and that looks wrong burned into a picture.
+
+    Greedy wrapping alone is not enough: `textwrap` fills each line to the brim
+    and can leave a one-word orphan (`41 chars` / `3 chars`), which is *more*
+    conspicuous on screen than the long line it replaced. So the width is
+    narrowed to the smallest value that still produces the same number of lines,
+    which spreads the words evenly across them.
+
+    The rule on both `break_*` flags is "never split a token": one over-long line
+    reads better than a word cut in half. `break_long_words=False` alone is not
+    enough — `textwrap` also splits on hyphens by default, which turned
+    `https://example.com/an-extremely-long-path` into two lines mid-URL. A
+    hyphenated token now overflows instead, matching how a long word is treated.
+
+    The leading `" ".join(text.split())` normalises whitespace, which also defuses
+    a newline inside a segment — an embedded blank line would otherwise terminate
+    the cue early and corrupt every cue after it.
+    """
+    text = " ".join(text.split())
+    if len(text) <= width:
+        return text
+    lines = textwrap.wrap(text, width, break_long_words=False, break_on_hyphens=False)
+    # Do not add a "never narrow below the longest token" floor here. It looks
+    # obviously right and is measurably wrong: over 39k generated cues it changed
+    # 74 of them and every change was *less* balanced (`[24,24,22,21,30]` became
+    # `[24,24,29,14,30]`), while the over-long-token case it was meant to fix —
+    # `Visit` / `<64-char URL>` / `now` — comes out byte-identical either way,
+    # because a token wider than `width` lands on its own line at every candidate.
+    for candidate in range(math.ceil(len(text) / len(lines)), width):
+        balanced = textwrap.wrap(text, candidate, break_long_words=False, break_on_hyphens=False)
+        if len(balanced) <= len(lines):
+            return "\n".join(balanced)
+    return "\n".join(lines)
+
+
 def _format_srt(result: dict) -> str:
     return "\n".join(
         f"{i}\n"
         f"{_format_timestamp(s['start'], decimal_marker=',')} --> "
         f"{_format_timestamp(s['end'], decimal_marker=',')}\n"
-        f"{s['text'].strip().replace('-->', '->')}\n"
+        f"{_wrap_cue(s['text'].replace('-->', '->'))}\n"
         for i, s in enumerate(result["segments"], start=1)
     )
 

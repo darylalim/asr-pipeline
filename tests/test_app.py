@@ -18,6 +18,7 @@ from streamlit_app import (
     MAX_DOWNLOAD_BYTES,
     PAGE_CONFIG,
     SELECT_WIDTH,
+    SUBTITLE_LINE_WIDTH,
     TRANSCRIPT_FORMATS,
     VIDEO_FORMATS,
     _display_transcription,
@@ -36,6 +37,7 @@ from streamlit_app import (
     _transcribe,
     _transcription_kwargs,
     _validate_time_range,
+    _wrap_cue,
 )
 
 MOCK_WHISPER_RESULT = {
@@ -1244,6 +1246,66 @@ def test_media_mime(filename, expected):
 )
 def test_escape_markdown(raw, expected):
     assert _escape_markdown(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("Short line.", "Short line."),
+        (
+            "The quick brown fox jumps over the lazy dog and keeps on running.",
+            "The quick brown fox jumps over the\nlazy dog and keeps on running.",
+        ),
+        # An embedded newline would otherwise close the cue early and corrupt
+        # every cue after it, so the whitespace collapse is structural.
+        ("line one\n\nline two", "line one line two"),
+        ("  padded   out  ", "padded out"),
+    ],
+    ids=["short_passthrough", "balanced_two_lines", "embedded_newlines", "whitespace"],
+)
+def test_wrap_cue(text, expected):
+    assert _wrap_cue(text) == expected
+
+
+def test_wrap_cue_balances_instead_of_orphaning():
+    # Greedy wrapping fills each line to the brim and leaves a short tail, which
+    # is more conspicuous over a picture than the long line it replaced. The
+    # re-wrap at the narrowest width holding the same line count is what fixes it.
+    #
+    # This sentence is chosen, not invented: plain textwrap gives 34/11 here and
+    # the balanced pass gives 24/21. Most sentences wrap identically under both,
+    # so an arbitrary long string makes this assertion pass without testing
+    # anything -- the first draft of this test used one and did exactly that.
+    lines = _wrap_cue("The internationalization committee reconvened.").split("\n")
+
+    assert len(lines) == 2
+    assert all(len(line) <= SUBTITLE_LINE_WIDTH for line in lines)
+    assert abs(len(lines[0]) - len(lines[1])) <= 5
+
+
+def test_wrap_cue_never_splits_a_token():
+    # break_long_words=False is not enough on its own: textwrap splits on hyphens
+    # by default, which cut this URL in half mid-path. An unbreakable token now
+    # overflows onto its own line instead, which is the accepted tradeoff.
+    url = "https://example.com/an-extremely-long-path-that-cannot-be-broken"
+    lines = _wrap_cue(f"Visit {url} now").split("\n")
+
+    assert url in lines
+    assert "".join(lines).count("-") == url.count("-")
+
+
+def test_format_srt_wraps_long_cues():
+    # The cue is valid SRT unwrapped and every player accepts it -- this is a
+    # display convention, so nothing but an explicit assertion catches a regression.
+    long_text = "A cue whose text runs well past the forty-two character line limit easily."
+    srt = _format_srt({"segments": [{"start": 0.0, "end": 3.0, "text": f" {long_text}"}]})
+
+    index, timing, *cue_lines = srt.rstrip("\n").split("\n")
+    assert index == "1"
+    assert timing == "00:00:00,000 --> 00:00:03,000"
+    assert len(cue_lines) > 1
+    assert all(len(line) <= SUBTITLE_LINE_WIDTH for line in cue_lines)
+    assert " ".join(cue_lines) == long_text
 
 
 @pytest.mark.parametrize(

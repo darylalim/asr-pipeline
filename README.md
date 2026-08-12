@@ -59,7 +59,7 @@ Optional controls:
 
 - **Primary language** — auto-detected by default
 - **Translate to English** — translate non-English audio
-- **Transcript format** — choose **Plain text** or **Subtitles**; picking Subtitles shows an editable SRT subtitle preview and switches the **Download** button from `.txt` to `.srt`
+- **Transcript format** — choose **Plain text** or **Subtitles**; picking Subtitles shows an editable SRT subtitle preview and switches the **Download** button from `.txt` to `.srt`. Subtitle cues are wrapped to 42 characters per line, the broadcast convention, with the lines balanced rather than one filled and one left short
 - **No verbatim** — skip silent stretches where Whisper appears to be hallucinating text, such as over music or applause after speech ends; it does not remove filler words or repetitions
 - **Decode segments independently** — disable prior-window context; more robust on noisy or music-heavy audio, at the cost of slightly choppier wording where 30 s windows meet
 - **Time range** — transcribe only selected portions; comma-separated `start,end` pairs in seconds (e.g., `30,90` for one clip, `0,60,120,180` for multiple); invalid ranges are flagged inline
