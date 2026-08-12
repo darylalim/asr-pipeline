@@ -405,6 +405,18 @@ def _handle_transcription(
     clip_timestamps: str = "0",
 ) -> None:
     transcriptions: list[dict] = []
+    # Per-file failures are collected here and rendered *after* the status block,
+    # not inside it. st.status collapses on its first update(label=...): update()
+    # clears the proto's `expanded` field unless it is passed again (see
+    # mutable_status_container.py), and the frontend's label-change branch then
+    # resets the open state to that now-false backend value. So an alert written
+    # into the status body during the loop landed inside a collapsed container
+    # carrying a *success* indicator: a failed file rendered a green check,
+    # "Transcribed 0/1 file", and no visible explanation anywhere on the page. The
+    # status stays expandable, so the text was reachable — but nothing on screen
+    # suggested a failure had happened or that anything was hidden, which is the
+    # part that made it a defect rather than a disclosure.
+    failures: list[tuple[str, Exception | None]] = []
     # Publish up front so a previous batch is cleared even if nothing succeeds
     # here. Streamlit interrupts a running script at the next ForwardMsg — the
     # status.update() below is such a point, and RerunException is a
@@ -465,14 +477,20 @@ def _handle_transcription(
                 # rebound rather than mutated.
                 st.session_state["transcription"] = transcriptions
             except RuntimeError as e:
-                _error(f"Transcription failed for {uploaded_file.name}: {e}")
+                failures.append((f"Transcription failed for {uploaded_file.name}: {e}", None))
             except Exception as e:
-                _error(f"Unexpected error for {uploaded_file.name}: {e}")
-                st.exception(e)
+                failures.append((f"Unexpected error for {uploaded_file.name}: {e}", e))
         status.update(
             label=f"Transcribed {len(transcriptions)}/{_plural(total, 'file')}",
-            state="complete",
+            state="error" if failures else "complete",
         )
+    # Replayed outside the status block, so the alerts land in the page body where
+    # they stay visible. A BaseException (RerunException) unwinds past this without
+    # replaying anything, which is correct: that run's output is discarded whole.
+    for message, unexpected in failures:
+        _error(message)
+        if unexpected is not None:
+            st.exception(unexpected)
 
 
 def _control_row():
@@ -776,7 +794,11 @@ if youtube_tab.open and youtube_url and YOUTUBE_URL_RE.match(youtube_url):
             data, filename, mime = _fetch_youtube_audio(youtube_url)
             youtube_audio = _RemoteAudio(filename, data)
             st.audio(data, format=mime)
-        except yt_dlp.utils.DownloadError as e:
+        # RuntimeError alongside DownloadError: the 500 MB stat gate inside
+        # _fetch_youtube_audio raises it, and without it here that already-tested
+        # guard surfaced as "Unexpected error" with a traceback attached. The URL
+        # path below already pairs its own RuntimeError with URLError this way.
+        except (yt_dlp.utils.DownloadError, RuntimeError) as e:
             _error(f"Could not download from YouTube: {e}")
         except Exception as e:
             _error(f"Unexpected error: {e}")
@@ -804,11 +826,31 @@ if url_tab.open and file_url and URL_RE.match(file_url):
                 _error(f"Unexpected error: {e}")
                 st.exception(e)
 
-audio_sources = (
-    uploaded_files
-    or ([recorded_audio] if recorded_audio else [])
-    or ([youtube_audio] if youtube_audio else [])
-    or ([url_audio] if url_audio else [])
+# The tab the user is looking at wins, and that is not what a flat priority chain
+# does. Upload and Record declare their widgets in ungated tab bodies, so their
+# values are sticky across tab switches, while youtube_audio/url_audio exist only
+# while their own tab is open. A plain `uploaded_files or ... or url_audio` chain
+# therefore let an earlier upload outrank the URL whose preview was on screen:
+# the fetch ran, the player rendered, the button enabled — and Transcribe
+# silently transcribed the upload. Three things hid it. Both previews render at
+# once, so two plausible sources are visible; the results subheader is the only
+# signal of which one ran and it arrives after a full model pass; and
+# _transcribe's cache makes the second click return instantly, which reads as
+# "the URL happened to produce the same text".
+#
+# The old order is kept as the *fallback*, for when the open tab has no source of
+# its own — an empty Record tab with an earlier upload still loaded — so the
+# button never goes dead while a usable source exists. That leaves a deliberate
+# residue: in exactly that case Transcribe still runs the upload.
+tab_sources: tuple[tuple[Any, Sequence[UploadedFile | _RemoteAudio]], ...] = (
+    (upload_tab, uploaded_files),
+    (record_tab, [recorded_audio] if recorded_audio else []),
+    (youtube_tab, [youtube_audio] if youtube_audio else []),
+    (url_tab, [url_audio] if url_audio else []),
+)
+audio_sources = next(
+    (sources for tab, sources in tab_sources if tab.open and sources),
+    next((sources for _, sources in tab_sources if sources), []),
 )
 # Render outside the Advanced options expander so a disabled Transcribe button
 # always shows its reason, even when the expander holding the input is collapsed.

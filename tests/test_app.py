@@ -726,6 +726,25 @@ def test_handle_transcription_partial_failure(mock_transcribe, mock_st):
     )
 
 
+@patch("streamlit_app._transcribe", side_effect=RuntimeError("boom"))
+def test_handle_transcription_renders_errors_after_the_status_closes(mock_transcribe, mock_st):
+    # st.status collapses on its first update(label=...) -- update() clears the
+    # proto's `expanded` field unless it is passed again, and the frontend's
+    # label-change branch then resets the open state to that now-false value. So
+    # an alert written into the status body during the loop lands in a box the
+    # user cannot open: a failed file rendered a green check, "Transcribed 0/1
+    # file", and no visible explanation anywhere on the page. The fix is
+    # positional, so the assertion is too -- st.error must run after the status
+    # context manager has exited.
+    _handle_transcription([_make_file()], **_handle_transcription_kwargs())
+
+    names = [c[0] for c in mock_st.mock_calls]
+    assert names.index("error") > names.index("status().__exit__")
+    # And a batch that lost a file is not "complete".
+    status = mock_st.status.return_value.__enter__.return_value
+    status.update.assert_called_with(label="Transcribed 0/1 file", state="error")
+
+
 @patch("streamlit_app._transcribe")
 def test_handle_transcription_keeps_finished_files_when_interrupted(mock_transcribe, mock_st):
     # Streamlit aborts a running script by raising RerunException (a BaseException,
@@ -1277,6 +1296,7 @@ def test_new_batch_replaces_previous_transcript_when_subtitles_toggled():
 # because AppTest re-executes the script each run and rebinds its imports.
 
 UPLOAD_TAB = ":material/upload: Upload"
+RECORD_TAB = ":material/mic: Record"
 YOUTUBE_TAB = ":material/smart_display: YouTube"
 URL_TAB = ":material/link: URL"
 
@@ -1373,6 +1393,60 @@ def test_youtube_preview_renders_inside_its_tab(tmp_path):
     assert len(_tab(at, YOUTUBE_TAB).get("audio")) == 1
     assert _tab(at, UPLOAD_TAB).get("audio") == []
     _assert_declared_mime(_tab(at, YOUTUBE_TAB).get("audio")[0], "audio/mp4")
+
+
+@pytest.mark.parametrize(
+    "active_tab,url,expected",
+    [
+        (URL_TAB, "https://example.com/remote.mp3", "remote.mp3"),
+        (RECORD_TAB, None, "upload.mp3"),
+    ],
+    ids=["active_tab_wins", "empty_tab_falls_back"],
+)
+def test_transcribe_dispatches_from_the_active_tab(active_tab, url, expected):
+    # Upload and Record declare their widgets in ungated tab bodies, so an upload
+    # stays loaded across tab switches, while youtube_audio/url_audio exist only
+    # while their own tab is open. Under a flat `uploaded_files or ...` chain the
+    # sticky upload outranked the URL whose preview was on screen: the fetch ran,
+    # the player rendered, the button enabled, and Transcribe silently ran the
+    # upload. Only the first case is a mutation check -- the second pins the
+    # deliberate fallback, so it passes either way: an open tab with no source of
+    # its own must not leave Transcribe dead while another source is loaded.
+    with (
+        patch("urllib.request.urlopen") as mock_urlopen,
+        patch("mlx_whisper.transcribe", return_value=MOCK_WHISPER_RESULT),
+    ):
+        _stub_urlopen(mock_urlopen, b"remote bytes")
+        at = _run_app(active_tab=active_tab)
+        # CLAUDE.md long claimed AppTest could not seed a file_uploader. It can as
+        # of 1.61.1 -- FileUploader.set_value takes (name, bytes, mime), or a
+        # sequence of those for accept_multiple_files=True.
+        at.file_uploader[0].set_value([("upload.mp3", b"upload bytes", "audio/mpeg")])
+        at.run()
+        if url is not None:
+            next(t for t in at.text_input if t.label == "Audio/video file URL").set_value(url)
+            at.run()
+        at.button[0].click().run()
+
+    assert not at.exception
+    assert [d["filename"] for d in at.session_state["transcription"]] == [expected]
+
+
+def test_youtube_runtime_error_renders_an_alert():
+    # _fetch_youtube_audio's 500 MB stat gate raises RuntimeError. Until it joined
+    # the DownloadError branch, that already-tested guard fell through to the
+    # generic handler and rendered "Unexpected error" *plus* a traceback --
+    # at.exception is what separates the two.
+    with patch("yt_dlp.YoutubeDL") as mock_ydl_cls:
+        ydl = MagicMock()
+        ydl.extract_info.side_effect = RuntimeError("YouTube audio exceeds 500 MB")
+        mock_ydl_cls.return_value.__enter__.return_value = ydl
+        at = _type_url("YouTube URL", "https://youtube.com/watch?v=big", YOUTUBE_TAB)
+
+    assert not at.exception
+    assert [e.value for e in at.error] == [
+        r"Could not download from YouTube\: YouTube audio exceeds 500 MB"
+    ]
 
 
 def test_active_remote_tab_enables_transcribe():
