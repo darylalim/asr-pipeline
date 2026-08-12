@@ -1375,6 +1375,30 @@ def test_wrap_cue_never_splits_a_token():
     assert "".join(lines).count("-") == url.count("-")
 
 
+def test_format_srt_drops_text_less_cues():
+    # mlx *clears* rather than removes a blank segment -- "if a segment is
+    # instantaneous or does not contain text, clear it" (transcribe.py) sets text
+    # to "" and still extends all_segments with it. Emitting one yields a block
+    # with an index, a timing line and no text: malformed SRT. Reachable on any
+    # run, since the same branch fires whenever start == end.
+    srt = _format_srt(
+        {
+            "segments": [
+                {"start": 0.0, "end": 2.0, "text": " Hello there"},
+                {"start": 2.0, "end": 5.0, "text": ""},
+                {"start": 5.0, "end": 5.0, "text": "   "},
+                {"start": 7.0, "end": 9.0, "text": " Goodbye"},
+            ]
+        }
+    )
+
+    blocks = srt.strip("\n").split("\n\n")
+    assert len(blocks) == 2
+    # Numbering must close the gap, not preserve the dropped indices.
+    assert [b.split("\n")[0] for b in blocks] == ["1", "2"]
+    assert blocks[1].endswith("Goodbye")
+
+
 def test_format_srt_wraps_long_cues():
     # The cue is valid SRT unwrapped and every player accepts it -- this is a
     # display convention, so nothing but an explicit assertion catches a regression.

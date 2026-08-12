@@ -335,12 +335,22 @@ def _wrap_cue(text: str, width: int = SUBTITLE_LINE_WIDTH) -> str:
 
 
 def _format_srt(result: dict) -> str:
+    # Blank segments are skipped, and mlx produces them routinely: "if a segment
+    # is instantaneous or does not contain text, clear it" (transcribe.py) sets
+    # `text` to "" and then *keeps* the segment in all_segments. Emitting one
+    # yields a block with an index, a timing line and no text at all — malformed
+    # SRT that strict parsers reject. Reachable on any run, not just under No
+    # verbatim: the same branch fires whenever `start == end`.
+    #
+    # Filtering before `enumerate` is what keeps cue numbers contiguous; skipping
+    # inside the loop would leave gaps in the sequence.
+    cues = (s for s in result["segments"] if s["text"].strip())
     return "\n".join(
         f"{i}\n"
         f"{_format_timestamp(s['start'], decimal_marker=',')} --> "
         f"{_format_timestamp(s['end'], decimal_marker=',')}\n"
         f"{_wrap_cue(s['text'].replace('-->', '->'))}\n"
-        for i, s in enumerate(result["segments"], start=1)
+        for i, s in enumerate(cues, start=1)
     )
 
 
