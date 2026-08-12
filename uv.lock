@@ -1829,7 +1829,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "mlx" },
+    { name = "mlx", specifier = ">=0.24.2" },
     { name = "mlx-whisper" },
     { name = "streamlit", specifier = ">=1.59" },
     { name = "yt-dlp" },

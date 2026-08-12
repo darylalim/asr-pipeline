@@ -520,16 +520,18 @@ def test_transcribe_single_clip_makes_one_call(mock_mlx):
 def test_transcribe_merges_multi_clip_results(mock_mlx):
     # Segment timestamps are already absolute (mlx derives them from `seek`, which
     # starts at the clip's own start frame), so segments concatenate with no
-    # adjustment and _format_srt is untouched. Language comes from the first clip.
+    # timestamp fix-up. Both clips carry id 0 because mlx numbers per call
+    # (`enumerate(current_segments, start=len(all_segments))`), so a plain
+    # concatenation would hand back duplicates -- a shape no single call produces.
     mock_mlx.transcribe.side_effect = [
         {
             "text": " one",
-            "segments": [{"start": 0.0, "end": 1.0, "text": " one"}],
+            "segments": [{"id": 0, "start": 0.0, "end": 1.0, "text": " one"}],
             "language": "en",
         },
         {
             "text": " two",
-            "segments": [{"start": 120.0, "end": 121.0, "text": " two"}],
+            "segments": [{"id": 0, "start": 120.0, "end": 121.0, "text": " two"}],
             "language": "fr",
         },
     ]
@@ -538,6 +540,10 @@ def test_transcribe_merges_multi_clip_results(mock_mlx):
 
     assert result["text"] == " one two"
     assert [s["start"] for s in result["segments"]] == [0.0, 120.0]
+    assert [s["id"] for s in result["segments"]] == [0, 1]
+    # Not "fr" -- though the clips cannot actually disagree: with language=None
+    # mlx detects from the first 30s of the *whole file*, not of the clip, so
+    # every call scores the same window. The mock differs only to pin which wins.
     assert result["language"] == "en"
 
 

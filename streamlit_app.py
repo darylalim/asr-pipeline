@@ -449,13 +449,25 @@ def _merge_transcriptions(results: list[dict]) -> dict:
 
     Segment timestamps are already absolute — mlx_whisper derives them from
     `seek`, which starts at the clip's own start frame — so segments concatenate
-    without adjustment and `_format_srt` needs no change. `language` comes from
-    the first clip: with `language=None` each clip auto-detects independently and
-    could in principle disagree, and one file gets one label.
+    with no timestamp fix-up.
+
+    `id` *is* renumbered. mlx assigns it per call as
+    `enumerate(current_segments, start=len(all_segments))`, so every clip restarts
+    from 0 and a plain concatenation carries duplicates — a shape no single call
+    ever produces. Nothing here reads `id` (`_format_srt` numbers cues with its
+    own `enumerate`), so this is about not handing back a malformed dict rather
+    than about a live bug.
+
+    `language` comes from the first clip, and the clips *cannot* disagree: with
+    `language=None` mlx detects from `pad_or_trim(mel, N_FRAMES)` — the first 30
+    seconds of the **whole file**, not of the clip — so every call scores the same
+    window and returns the same answer. An earlier version of this docstring said
+    they detect independently and could in principle differ; they do not.
     """
+    segments = [segment for r in results for segment in r["segments"]]
     return {
         "text": "".join(r["text"] for r in results),
-        "segments": [segment for r in results for segment in r["segments"]],
+        "segments": [{**segment, "id": i} for i, segment in enumerate(segments)],
         "language": results[0]["language"],
     }
 

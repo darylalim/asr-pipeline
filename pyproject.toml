@@ -9,7 +9,11 @@ dependencies = [
     # Direct, not transitive-via-mlx-whisper: streamlit_app imports mlx.core to
     # call mx.clear_cache() after each batch. mlx-whisper would pull it in
     # regardless, but an undeclared import breaks the moment that stops being true.
-    "mlx",
+    # The floor is a real API minimum, not caution: mx.clear_cache() does not exist
+    # at 0.22.1 (checked directly, along with 0.20.0), and does at 0.24.2. 0.23.0
+    # is untested because it ships no cp313 wheel, so the floor is the lowest
+    # version actually confirmed rather than the lowest that might work.
+    "mlx>=0.24.2",
     "mlx-whisper",
     "streamlit>=1.59",
     "yt-dlp",
