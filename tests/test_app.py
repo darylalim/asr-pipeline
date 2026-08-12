@@ -13,6 +13,7 @@ from streamlit_app import (
     AUDIO_FORMATS,
     DEFAULT_MEDIA_MIME,
     ERROR_ICON,
+    ERROR_MESSAGE_LIMIT,
     FORMAT_PLAIN_TEXT,
     FORMAT_SUBTITLES,
     MAX_DOWNLOAD_BYTES,
@@ -21,6 +22,7 @@ from streamlit_app import (
     SUBTITLE_LINE_WIDTH,
     TRANSCRIPT_FORMATS,
     VIDEO_FORMATS,
+    _condense,
     _display_transcription,
     _error,
     _escape_markdown,
@@ -689,6 +691,79 @@ def test_handle_transcription_pluralizes_the_status_labels(
     mock_st.status.assert_called_once_with(opening, expanded=True)
     status = mock_st.status.return_value.__enter__.return_value
     status.update.assert_called_with(label=closing, state="complete")
+
+
+@pytest.mark.parametrize(
+    "message,expected",
+    [
+        ("Short and fine.", "Short and fine."),
+        ("collapse   these\n\nspaces", "collapse these spaces"),
+    ],
+    ids=["passthrough", "whitespace"],
+)
+def test_condense_leaves_human_sized_messages_alone(message, expected):
+    assert _condense(message) == expected
+
+
+def test_condense_keeps_both_ends():
+    # Head *and* tail, not truncation: the two useful halves of a long exception
+    # sit at opposite ends. mlx_whisper raises RuntimeError("Failed to load
+    # audio: " + ffmpeg's whole stderr) -- 1740 characters on a corrupt file, of
+    # which ~1500 are the version banner and --enable-* flags, with the actual
+    # diagnosis last. Truncating from the front would render only the banner.
+    long_message = (
+        "Transcription failed for clip.wav: Failed to load audio: "
+        + "ffmpeg version 7.1.1 --enable-everything " * 40
+        + "Invalid data found when processing input"
+    )
+    condensed = _condense(long_message)
+
+    assert len(condensed) <= ERROR_MESSAGE_LIMIT + len(" […] ")
+    assert condensed.startswith("Transcription failed for clip.wav:")
+    assert condensed.endswith("Invalid data found when processing input")
+    assert " […] " in condensed
+
+
+def test_error_condenses_before_rendering(mock_st):
+    # The cap has to be applied inside _error rather than at the call sites, for
+    # the same reason the icon is: seven callers, and a new one must not be able
+    # to render an unbounded alert.
+    _error("Unexpected error for clip.wav: " + "verbose library noise " * 200)
+
+    (rendered,), _ = mock_st.error.call_args
+    assert len(rendered) < 400
+    assert "…" in rendered
+
+
+def test_error_still_escapes_after_condensing(mock_st):
+    # Condensing runs first and escaping second, so a payload surviving the cap
+    # is still neutralised. The order matters: escaping first would let the slice
+    # land between a backslash and the character it escapes, silently un-escaping
+    # whatever sits on the cut.
+    _error(
+        "Could not download from YouTube: Unsupported URL: "
+        "https://youtu.be/![](https://attacker.example/p.png)" + " padding" * 200
+    )
+
+    (rendered,), _ = mock_st.error.call_args
+    assert "![](" not in rendered
+
+
+def test_error_condenses_before_escaping(mock_st):
+    # The order is load-bearing, not incidental. Escaping first would let the cut
+    # land *between* a backslash and the character it escapes, dropping the
+    # backslash into the head and releasing a live `[` or `:` into the tail.
+    #
+    # The signature is the ellipsis marker itself: inserted before escaping it
+    # comes out escaped, and inserted after it arrives raw. No boundary
+    # arithmetic needed -- a first draft of this test computed the cut's parity to
+    # land a backslash exactly on it, which was both fragile and unnecessary.
+    _error("Failed: " + ":" * ERROR_MESSAGE_LIMIT * 4)
+
+    (rendered,), _ = mock_st.error.call_args
+    assert r"\[…\]" in rendered
+    # And nothing lost its backslash on the way through the cut.
+    assert ":" not in rendered.replace(r"\:", "")
 
 
 @pytest.mark.parametrize(

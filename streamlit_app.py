@@ -79,6 +79,22 @@ AUDIO_ONLY_MIME_TYPES = {
 # "text/plain"`, so an empty string would serve audio as text.
 DEFAULT_MEDIA_MIME = "audio/wav"
 ERROR_ICON = ":material/error:"
+# Cap on an error alert's length, applied head-and-tail rather than as a plain
+# truncation. The exception text reaching _error was not written for a UI: a
+# corrupt file makes mlx_whisper raise RuntimeError("Failed to load audio: " +
+# ffmpeg's entire stderr) — measured at 1740 characters over 14 lines, of which
+# roughly 1500 are ffmpeg's version banner and its --enable-* configure flags.
+# That cost nothing while per-file errors rendered into a collapsed st.status
+# nobody had reason to open; making them visible is what turned it into a wall of
+# text, so this is a consequence of that fix rather than a pre-existing wart.
+#
+# Both ends are kept because the two useful halves sit at opposite ends: the head
+# carries "Transcription failed for <name>: Failed to load audio:" (what failed)
+# and the tail carries "Invalid data found when processing input" (why). Keeping
+# only the first line renders the version banner; keeping only the last drops the
+# filename and the operation. 240 was chosen by rendering 240/320/400 against the
+# real failure — it is the smallest that still lands both ends.
+ERROR_MESSAGE_LIMIT = 240
 # Characters per subtitle line. 42 is the long-standing broadcast convention
 # (Netflix, BBC and EBU all land on 42 for Latin scripts) and it is a *display*
 # constraint, not an SRT one — the format itself imposes no limit, which is why
@@ -364,6 +380,21 @@ def _escape_markdown(text: str) -> str:
     return _MARKDOWN_ESCAPE_RE.sub(r"\\\1", " ".join(text.split()))
 
 
+def _condense(message: str) -> str:
+    """Collapse `message` to one line and cap it at both ends.
+
+    See `ERROR_MESSAGE_LIMIT` for why both ends are kept rather than truncating.
+    Anything already inside the limit passes through unchanged — every
+    `_validate_time_range` result, and every failure whose exception has a
+    human-sized string — so this only fires on the pathological cases.
+    """
+    message = " ".join(message.split())
+    if len(message) <= ERROR_MESSAGE_LIMIT:
+        return message
+    half = ERROR_MESSAGE_LIMIT // 2
+    return f"{message[:half].rstrip()} […] {message[-half:].lstrip()}"
+
+
 def _error(message: str) -> None:
     """Render an error alert with the app's icon, as literal text.
 
@@ -379,9 +410,11 @@ def _error(message: str) -> None:
     `https://youtu.be/![](https://host/p.png)` arrives verbatim and would fire an
     outbound request. _validate_time_range likewise echoes the raw input back.
     Routing every call through here also makes the icon structural instead of a
-    literal repeated at seven call sites, where a new one renders a bare box.
+    literal repeated at seven call sites, where a new one renders a bare box —
+    and gives `_condense` a single place to bound the length, which matters for
+    the same reason: the text is a library's, not ours. See `ERROR_MESSAGE_LIMIT`.
     """
-    st.error(_escape_markdown(message), icon=ERROR_ICON)
+    st.error(_escape_markdown(_condense(message)), icon=ERROR_ICON)
 
 
 def _validate_time_range(raw: str) -> str | None:
