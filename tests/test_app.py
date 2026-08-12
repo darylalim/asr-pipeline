@@ -852,6 +852,37 @@ def test_handle_transcription_keeps_finished_files_when_interrupted(mock_transcr
     assert transcriptions[0]["filename"] == "first.mp3"
 
 
+@patch("streamlit_app.mx")
+@patch("streamlit_app._transcribe", return_value=MOCK_WHISPER_RESULT)
+def test_handle_transcription_reclaims_the_mlx_cache(mock_transcribe, mock_mx, mock_st):
+    # mlx keeps freed device buffers on a free list instead of returning them, so
+    # a finished batch stays resident for the life of the server process.
+    # Measured against whisper-large-v3-turbo with word_timestamps=True: 894 MB
+    # held after an 8-second file, 1.25 GB after two minutes, all reclaimed in
+    # 4.2 ms, with the model itself untouched in `active` memory.
+    _handle_transcription([_make_file()], **_handle_transcription_kwargs())
+
+    mock_mx.clear_cache.assert_called_once_with()
+
+
+@patch("streamlit_app.mx")
+def test_handle_transcription_reclaims_the_mlx_cache_when_interrupted(mock_mx, mock_st):
+    # This is why it is a `finally` and not a call after the block. A tab switch
+    # -- or any widget -- raises RerunException, a BaseException, mid-batch; an
+    # interrupted run would otherwise hold its buffers until whenever the next
+    # transcription happens to finish, which may be never.
+    class _Interrupt(BaseException):
+        pass
+
+    with (
+        patch("streamlit_app._transcribe", side_effect=_Interrupt()),
+        pytest.raises(_Interrupt),
+    ):
+        _handle_transcription([_make_file()], **_handle_transcription_kwargs())
+
+    mock_mx.clear_cache.assert_called_once_with()
+
+
 @patch("streamlit_app._transcribe")
 def test_handle_transcription_clears_previous_batch(mock_transcribe, mock_st):
     mock_st.session_state["transcription"] = [_make_transcription(filename="stale.mp3")]

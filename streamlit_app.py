@@ -9,6 +9,13 @@ from urllib.error import URLError
 from urllib.parse import unquote, urlparse
 from urllib.request import urlopen
 
+# mlx/core is a compiled extension (core.cpython-313-darwin.so) that ships no
+# .pyi alongside its py.typed marker, so ty cannot introspect it and reports
+# unresolved-import. The suppression is scoped to this line rather than turned
+# into a [tool.ty] rule override, so a genuinely missing import still fails.
+# mlx_whisper imports it the same way; ty only checks first-party code, which is
+# why the same statement inside site-packages raises nothing.
+import mlx.core as mx  # ty: ignore[unresolved-import]
 import mlx_whisper
 import streamlit as st
 import yt_dlp
@@ -491,60 +498,84 @@ def _handle_transcription(
     # Download button, whose payload is the text area's return value, serves it.
     st.session_state["batch_id"] = st.session_state.get("batch_id", 0) + 1
     total = len(uploaded_files)
-    with st.status(f"Transcribing {_plural(total, 'file')}...", expanded=True) as status:
-        for i, uploaded_file in enumerate(uploaded_files, start=1):
-            # Escape before interpolating anywhere Markdown renders. An st.status
-            # label takes the Markdown label subset — which includes images, so a
-            # filename carrying `![](https://host/x.png)` would fetch on *every*
-            # file, not just a failure — and st.error below renders full Markdown.
-            # See _escape_markdown for what it does and does not cover.
-            name_md = _escape_markdown(uploaded_file.name)
-            status.update(label=f"Transcribing {name_md} ({i}/{total})...")
-            name = Path(uploaded_file.name)
-            # Rewind before reading. UploadedFile subclasses io.BytesIO, and the
-            # deserialized widget value is cached in session state
-            # (WStates.__getitem__ stores Value(deserialized)), so the *same*
-            # object — and the same cursor — survives every rerun. read() leaves
-            # it at EOF, so a second Transcribe on an unchanged recording would
-            # hand _transcribe b"". This used to be masked by st.audio's own
-            # data.seek(0) inside _marshall_av_media, which ran once per rerun for
-            # each preview; that is a side effect of a display call, not a
-            # contract, and the Record tab deliberately renders no preview.
-            # _RemoteAudio has no cursor and needs no rewind.
-            if isinstance(uploaded_file, UploadedFile):
-                uploaded_file.seek(0)
-            try:
-                result = _transcribe(
-                    uploaded_file.read(),
-                    name.suffix,
-                    language=language,
-                    task=task,
-                    initial_prompt=initial_prompt,
-                    no_verbatim=no_verbatim,
-                    condition_on_previous_text=condition_on_previous_text,
-                    clip_timestamps=clip_timestamps,
-                )
-                transcriptions.append(
-                    {
-                        "result": result,
-                        "file_stem": f"{name.stem}_{name.suffix.lstrip('.')}_transcript",
-                        "filename": uploaded_file.name,
-                        "include_subtitles": include_subtitles,
-                    }
-                )
-                # Redundant while session_state holds this exact list (append
-                # mutates it in place), but kept explicit so the progressive
-                # publish does not silently break if `transcriptions` is ever
-                # rebound rather than mutated.
-                st.session_state["transcription"] = transcriptions
-            except RuntimeError as e:
-                failures.append((f"Transcription failed for {uploaded_file.name}: {e}", None))
-            except Exception as e:
-                failures.append((f"Unexpected error for {uploaded_file.name}: {e}", e))
-        status.update(
-            label=f"Transcribed {len(transcriptions)}/{_plural(total, 'file')}",
-            state="error" if failures else "complete",
-        )
+    try:
+        with st.status(f"Transcribing {_plural(total, 'file')}...", expanded=True) as status:
+            for i, uploaded_file in enumerate(uploaded_files, start=1):
+                # Escape before interpolating anywhere Markdown renders. An st.status
+                # label takes the Markdown label subset — which includes images, so a
+                # filename carrying `![](https://host/x.png)` would fetch on *every*
+                # file, not just a failure — and st.error below renders full Markdown.
+                # See _escape_markdown for what it does and does not cover.
+                name_md = _escape_markdown(uploaded_file.name)
+                status.update(label=f"Transcribing {name_md} ({i}/{total})...")
+                name = Path(uploaded_file.name)
+                # Rewind before reading. UploadedFile subclasses io.BytesIO, and the
+                # deserialized widget value is cached in session state
+                # (WStates.__getitem__ stores Value(deserialized)), so the *same*
+                # object — and the same cursor — survives every rerun. read() leaves
+                # it at EOF, so a second Transcribe on an unchanged recording would
+                # hand _transcribe b"". This used to be masked by st.audio's own
+                # data.seek(0) inside _marshall_av_media, which ran once per rerun for
+                # each preview; that is a side effect of a display call, not a
+                # contract, and the Record tab deliberately renders no preview.
+                # _RemoteAudio has no cursor and needs no rewind.
+                if isinstance(uploaded_file, UploadedFile):
+                    uploaded_file.seek(0)
+                try:
+                    result = _transcribe(
+                        uploaded_file.read(),
+                        name.suffix,
+                        language=language,
+                        task=task,
+                        initial_prompt=initial_prompt,
+                        no_verbatim=no_verbatim,
+                        condition_on_previous_text=condition_on_previous_text,
+                        clip_timestamps=clip_timestamps,
+                    )
+                    transcriptions.append(
+                        {
+                            "result": result,
+                            "file_stem": f"{name.stem}_{name.suffix.lstrip('.')}_transcript",
+                            "filename": uploaded_file.name,
+                            "include_subtitles": include_subtitles,
+                        }
+                    )
+                    # Redundant while session_state holds this exact list (append
+                    # mutates it in place), but kept explicit so the progressive
+                    # publish does not silently break if `transcriptions` is ever
+                    # rebound rather than mutated.
+                    st.session_state["transcription"] = transcriptions
+                except RuntimeError as e:
+                    failures.append((f"Transcription failed for {uploaded_file.name}: {e}", None))
+                except Exception as e:
+                    failures.append((f"Unexpected error for {uploaded_file.name}: {e}", e))
+            status.update(
+                label=f"Transcribed {len(transcriptions)}/{_plural(total, 'file')}",
+                state="error" if failures else "complete",
+            )
+    finally:
+        # Reclaim MLX's allocator cache now the batch is done. mlx keeps freed
+        # device buffers on a free list instead of returning them, so a finished
+        # transcription leaves them resident for the life of the server process.
+        # Measured here against whisper-large-v3-turbo with word_timestamps=True:
+        # 894 MB held after an 8-second file and 1.25 GB after two minutes, all of
+        # it reclaimed, for 4.2 ms. The next run costs 0.76 s against 0.74 s with
+        # the cache warm — it re-allocates rather than reloading, because the
+        # *model* lives in `active` memory (a flat 1543 MB across every
+        # measurement) and clear_cache() does not touch it.
+        #
+        # Verify with mx.get_cache_memory(), NOT with `top`. RSS moved 2.6 MB while
+        # 894 MB was reclaimed, because these are device-mapped MTLBuffers — anyone
+        # checking the process's resident size concludes this did nothing.
+        #
+        # mx.set_cache_limit() is the obvious cheaper alternative and is worse: it
+        # caps the free list *during* decode, throttling the run it is meant to
+        # help. A batch boundary costs nothing in the middle of the work.
+        #
+        # `finally`, not a plain call after the block: a tab switch or any widget
+        # raises RerunException mid-batch, and an interrupted run would otherwise
+        # hold its buffers until whenever the next transcription finishes.
+        mx.clear_cache()
     # Replayed outside the status block, so the alerts land in the page body where
     # they stay visible. A BaseException (RerunException) unwinds past this without
     # replaying anything, which is correct: that run's output is discarded whole.

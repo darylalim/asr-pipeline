@@ -6,6 +6,10 @@ requires-python = ">=3.12"
 license = "MIT"
 license-files = ["LICENSE"]
 dependencies = [
+    # Direct, not transitive-via-mlx-whisper: streamlit_app imports mlx.core to
+    # call mx.clear_cache() after each batch. mlx-whisper would pull it in
+    # regardless, but an undeclared import breaks the moment that stops being true.
+    "mlx",
     "mlx-whisper",
     "streamlit>=1.59",
     "yt-dlp",
