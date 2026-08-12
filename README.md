@@ -6,7 +6,7 @@
 
 Transcribe and translate audio and video **locally on your Mac** — no cloud, no uploads, no cost. This Streamlit application is powered by OpenAI's Whisper and accelerated on Apple Silicon with MLX (Apple's machine-learning framework). Bring your own files, record straight from the browser, or paste a YouTube or media URL.
 
-![Whisper Transcribe — the app's four input tabs (Upload, Record, YouTube, URL) with language, translation, subtitle, and advanced transcription controls](docs/screenshot.png)
+![Whisper Transcribe — the app's four input tabs (Upload, Record, YouTube, URL) above a bordered settings card holding the primary-language selector, a translate toggle, a Plain text / Subtitles transcript-format control, a no-verbatim toggle, and a collapsed Advanced options panel, with a Transcribe button below it](docs/screenshot.png)
 
 ## Features
 
@@ -27,7 +27,7 @@ Transcribe and translate audio and video **locally on your Mac** — no cloud, n
 
 You provide audio or video through one of four tabs (upload, record, YouTube, or URL). The app writes the audio to a temporary file and runs `mlx_whisper.transcribe()` with the Whisper large-v3-turbo model locally on Apple Silicon via MLX. The result is cached, rendered as editable plain text (or SRT when subtitles are enabled), and can be downloaded as `.txt` or `.srt`. See [CLAUDE.md](CLAUDE.md) for the full architecture.
 
-![A completed transcription in Whisper Transcribe — a "Transcribed 1/1 file(s)" status above a bordered result section holding the filename, the editable transcript, and a Download button to save it as .txt or .srt](docs/screenshot-result.png)
+![A completed transcription in Whisper Transcribe — a "Transcribed 1/1 file" status above a bordered result section holding the filename, the editable transcript, and a Download button to save it as .txt or .srt](docs/screenshot-result.png)
 
 ## Requirements
 
@@ -59,13 +59,13 @@ Optional controls:
 
 - **Primary language** — auto-detected by default
 - **Translate to English** — translate non-English audio
-- **Include subtitles** — show an editable SRT subtitle preview; the **Download** button then serves a `.srt` file instead of `.txt`
+- **Transcript format** — choose **Plain text** or **Subtitles**; picking Subtitles shows an editable SRT subtitle preview and switches the **Download** button from `.txt` to `.srt`
 - **No verbatim** — skip silent stretches where Whisper appears to be hallucinating text, such as over music or applause after speech ends; it does not remove filler words or repetitions
 - **Decode segments independently** — disable prior-window context; more robust on noisy or music-heavy audio, at the cost of slightly choppier wording where 30 s windows meet
 - **Time range** — transcribe only selected portions; comma-separated `start,end` pairs in seconds (e.g., `30,90` for one clip, `0,60,120,180` for multiple); invalid ranges are flagged inline
 - **Keyterms** — bias decoding toward specific terms (proper nouns, jargon)
 
-**Decode segments independently**, **Time range**, and **Keyterms** are grouped under an **Advanced options** expander.
+**Decode segments independently**, **Time range**, and **Keyterms** are grouped under an **Advanced options** expander, inside the same settings card as the controls above.
 
 ## Development
 

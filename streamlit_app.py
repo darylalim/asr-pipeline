@@ -70,6 +70,16 @@ AUDIO_ONLY_MIME_TYPES = {
 # "text/plain"`, so an empty string would serve audio as text.
 DEFAULT_MEDIA_MIME = "audio/wav"
 ERROR_ICON = ":material/error:"
+# The transcript format choice, as the segmented control renders it. This governs
+# two things at once -- what the results text area shows (plain text vs timestamped
+# SRT cues) and which extension the Download button serves (.txt vs .srt) -- which
+# is why it is a two-option format picker rather than the "Include subtitles" toggle
+# it used to be: a boolean names one of the two states and leaves the other implied,
+# so the .srt consequence was reachable only through the help tooltip. Order is
+# display order, and FORMAT_PLAIN_TEXT is the default.
+FORMAT_PLAIN_TEXT = "Plain text"
+FORMAT_SUBTITLES = "Subtitles"
+TRANSCRIPT_FORMATS = (FORMAT_PLAIN_TEXT, FORMAT_SUBTITLES)
 LANGUAGE_CODES: list[str | None] = [None] + sorted(LANGUAGES, key=lambda c: LANGUAGES[c])
 YOUTUBE_URL_RE = re.compile(r"^https?://(www\.|m\.)?(youtube\.com/|youtu\.be/)", re.IGNORECASE)
 URL_RE = re.compile(r"^https?://", re.IGNORECASE)
@@ -78,22 +88,36 @@ URL_RE = re.compile(r"^https?://", re.IGNORECASE)
 # while only the URL path was capped). Distinct from server.maxUploadSize, which
 # bounds a per-file browser PUT that never enters these caches.
 MAX_DOWNLOAD_BYTES = 500 * 1024 * 1024
-# Shared width of every right-hand control: the language selectbox and the
-# Transcribe and Download buttons. It has to be an explicit number because
-# st.selectbox has no width="content" (its default is "stretch", which fills a
-# horizontal container); the two buttons take the same value so all three are
-# the same width. Note that is a shared *width*, not a shared right *edge*:
-# Download sits inside _display_transcription's st.container(border=True), whose
-# 15px padding plus 1px border insets the content box from 704px to 672px, so
-# Download lands 16px in (x=768, right=936) from the selectbox and Transcribe
-# (x=784, right=952). That inset is correct — it makes Download flush with the
-# text area inside its own card — and is not removable without custom CSS, which
-# this app does not use. Originally reverse-engineered from st.columns([3, 1]) — the
-# `centered` layout's main block has a 704px content box and st.columns puts a
-# 32px gap between the two columns, so the right column was (704 - 32) / 4 =
-# 168px — and kept at that value so the rendered layout is unchanged now that
-# the columns are gone.
+# Shared width of every right-hand control: the language selectbox, the Time range
+# input, and the Transcribe and Download buttons. It has to be an explicit number
+# because st.selectbox has no width="content" (its default is "stretch", which
+# fills a horizontal container); the others take the same value so all four match.
+#
+# It is a shared *width*, not a shared right *edge*. Re-measured at a 1200px
+# viewport: the selectbox and Download both land at x=768, right=936, while
+# Transcribe lands at x=784, right=952. The split is not arbitrary — it is exactly
+# "inside a bordered card" versus "not". A st.container(border=True) has computed
+# padding: 15px plus a 1px border, insetting its content box from 704px to 672px,
+# and the selectbox (controls card) and Download (results card) each sit in one.
+# Transcribe sits outside both, so it stays flush with the 704px content edge —
+# which is also where the controls card's own right border falls, so the button
+# lines up with the card above it rather than with the selectbox inside it. That is
+# the correct look and is not removable without custom CSS, which this app does not
+# use: do not "fix" it by dropping border=True or hand-padding.
+#
+# Originally reverse-engineered from st.columns([3, 1]) — the `centered` layout's
+# main block has a 704px content box and st.columns puts a 32px gap between the two
+# columns, so the right column was (704 - 32) / 4 = 168px — and kept at that value
+# so the rendered layout is unchanged now that the columns are gone.
 SELECT_WIDTH = 168
+# Height of the st.skeleton standing in for a remote tab's st.audio preview while
+# the fetch runs, measured off the rendered player rather than guessed. Matching it
+# is the whole point of the skeleton: the cache's show_spinner already says a
+# download is happening, so what the placeholder adds is holding the preview's space
+# so the controls below do not jump when the player replaces it. A wrong value trades
+# one jump for a smaller one. Re-measure if the preview ever stops being a bare
+# st.audio: getComputedStyle on [data-testid="stAudio"] reports the rendered height.
+AUDIO_PREVIEW_HEIGHT = 40
 PAGE_CONFIG: dict[str, Any] = {
     "page_title": "Whisper Transcribe",
     "page_icon": ":material/graphic_eq:",
@@ -119,7 +143,31 @@ class _RemoteAudio:
 # hands back the same object and collapses the first two. Safe here only because
 # the return is a tuple of immutables: a shared mutable would be a cross-session
 # aliasing bug. Note _clear_caches must call st.cache_resource.clear() too.
-@st.cache_resource(show_spinner="Downloading audio from YouTube...", max_entries=5, ttl="1h")
+#
+# max_entries=2, not 5, and it is the *only* lever on the memory ceiling. These two
+# caches hold raw audio, so the worst case is entries x MAX_DOWNLOAD_BYTES x 2
+# caches -- 5 GB at the old value, 2 GB at this one. ttl looks like it should help
+# and does not: Streamlit's ttl_cache expires lazily, so an expired entry reads as
+# absent but is only actually dropped by a write, an expire() call, or a
+# length/size query. It bounds staleness, not resident memory, and an idle server
+# can hold expired payloads indefinitely. max_entries is what bounds how many can
+# coexist. The cost of the smaller number is a re-download when a user cycles
+# through more than two remote sources inside the ttl window; 2 still covers going
+# back to the previous one, which is the common case.
+#
+# show_spinner=False, and this reverses an earlier decision on purpose. These two
+# fetches used to pass a "Downloading audio from..." message on the grounds that,
+# unlike _transcribe, nothing wraps them in an st.status and the cache spinner was
+# the only progress signal. The st.skeleton in each tab's reserved slot is now that
+# signal, and the spinner actively fights it: the spinner is an *extra* element with
+# no reserved space, so during a download it grows the slot by its own height and
+# pushes the settings card and Transcribe button down ~40px, which then snap back
+# when it clears. Measured against a deliberately slow local server, with both, the
+# card rendered stale-faded with the spinner text overlapping it; with the skeleton
+# alone the page does not move at all, because a skeleton sized to the preview it
+# replaces is layout-neutral by construction. Reserving space is the whole point of
+# the pattern, and the spinner is the thing that breaks the reservation.
+@st.cache_resource(show_spinner=False, max_entries=2, ttl="1h")
 def _fetch_youtube_audio(url: str) -> tuple[bytes, str, str]:
     with tempfile.TemporaryDirectory() as tmpdir:
         ydl_opts = {
@@ -156,9 +204,7 @@ def _fetch_youtube_audio(url: str) -> tuple[bytes, str, str]:
         )
 
 
-@st.cache_resource(
-    show_spinner="Downloading audio from URL...", max_entries=5, ttl="1h"
-)  # See above.
+@st.cache_resource(show_spinner=False, max_entries=2, ttl="1h")  # See above.
 def _fetch_url_audio(url: str) -> tuple[bytes, str, str]:
     with urlopen(url, timeout=60) as resp:
         data = resp.read(MAX_DOWNLOAD_BYTES + 1)
@@ -194,6 +240,15 @@ def _media_mime(filename: str, *, audio_only: bool = False) -> str:
     """
     mime = MEDIA_MIME_TYPES.get(Path(filename).suffix.lstrip(".").lower(), DEFAULT_MEDIA_MIME)
     return AUDIO_ONLY_MIME_TYPES.get(mime, mime) if audio_only else mime
+
+
+def _plural(count: int, noun: str) -> str:
+    """`1 file` / `2 files`, so the status label never reads `1 file(s)`.
+
+    Every batch renders this string, and a single file is the common case — which
+    is exactly the one the parenthesised form gets wrong.
+    """
+    return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
 
 
 def _format_language(code: str | None) -> str:
@@ -363,7 +418,7 @@ def _handle_transcription(
     # Download button, whose payload is the text area's return value, serves it.
     st.session_state["batch_id"] = st.session_state.get("batch_id", 0) + 1
     total = len(uploaded_files)
-    with st.status(f"Transcribing {total} file(s)...", expanded=True) as status:
+    with st.status(f"Transcribing {_plural(total, 'file')}...", expanded=True) as status:
         for i, uploaded_file in enumerate(uploaded_files, start=1):
             # Escape before interpolating anywhere Markdown renders. An st.status
             # label takes the Markdown label subset — which includes images, so a
@@ -415,7 +470,7 @@ def _handle_transcription(
                 _error(f"Unexpected error for {uploaded_file.name}: {e}")
                 st.exception(e)
         status.update(
-            label=f"Transcribed {len(transcriptions)}/{total} file(s)",
+            label=f"Transcribed {len(transcriptions)}/{_plural(total, 'file')}",
             state="complete",
         )
 
@@ -525,6 +580,12 @@ def _display_transcription() -> None:
 # UI
 st.set_page_config(**PAGE_CONFIG)
 st.title("Whisper Transcribe")
+# Orientation for a first-time visitor, who otherwise meets a bare title and a
+# dropzone. st.caption rather than st.info: design.md scopes the callout styles to
+# instructions and problems, and this is neither. Deliberately says "transcribed"
+# rather than a flat "nothing leaves your Mac" — the YouTube and URL tabs do reach
+# the network, so the stronger claim would be false in two of the four modes.
+st.caption("Audio and video, transcribed and translated locally on your Mac.")
 
 upload_tab, record_tab, youtube_tab, url_tab = st.tabs(
     [
@@ -574,76 +635,125 @@ with youtube_tab:
 with url_tab:
     file_url = st.text_input(
         "Audio/video file URL",
-        placeholder="Audio/video file URL",
+        # A worked example, not a restatement of the (collapsed) label — which is
+        # what this placeholder used to be, and the one remote tab that did not
+        # show the user what a valid value looks like.
+        placeholder="https://example.com/audio.mp3",
         label_visibility="collapsed",
     ).strip()
     url_slot = st.container()  # Deferred like the YouTube preview above.
 
-with _control_row():
-    st.markdown(
-        "Primary language",
-        help=(
-            "The primary language spoken in an uploaded file. "
-            "By default, the primary language will be detected automatically."
-        ),
-    )
-    language = st.selectbox(
-        "Primary language",
-        LANGUAGE_CODES,
-        width=SELECT_WIDTH,
-        format_func=_format_language,
-        label_visibility="collapsed",
-    )
+# One bordered card around every control. They have been described as "grouped by
+# intent (input → output → advanced)" since they were written, but until now that
+# grouping was pure source ordering: four identical rows rendered flat between the
+# dropzone and the expander, with nothing marking where input ends and output
+# begins. The card gives the group an edge, and reuses the
+# st.container(border=True) that already wraps each result in
+# _display_transcription, so settings and results read as the same kind of surface.
+#
+# Advanced options is nested *inside* the card rather than left as its own
+# top-level block, and both halves of that are deliberate. Semantically it is the
+# third member of this group, not a peer of it. Visually, leaving it outside put
+# two identically-bordered boxes a few px apart and the card read as though it had
+# been cut in half; inset by the card's padding the expander instead reads as
+# subordinate to it. Verified by rendering both.
+with st.container(border=True):
+    with _control_row():
+        st.markdown(
+            "Primary language",
+            help=(
+                # Not "an uploaded file": only one of the four input modes is an
+                # upload, and this selector governs all of them.
+                "The primary language spoken in the audio. "
+                "By default, the primary language will be detected automatically."
+            ),
+        )
+        language = st.selectbox(
+            "Primary language",
+            LANGUAGE_CODES,
+            width=SELECT_WIDTH,
+            format_func=_format_language,
+            label_visibility="collapsed",
+        )
 
-translate = _labeled_toggle(
-    "Translate to English",
-    "Translates audio to English instead of transcribing in the source language.",
-)
-include_subtitles = _labeled_toggle(
-    "Include subtitles",
-    "Best for adding subtitles to a video. Shows the transcript as editable, "
-    "timestamped SRT cues, and switches the Download button from .txt to .srt.",
-)
-no_verbatim = _labeled_toggle(
-    "No verbatim",
-    "Skips silent stretches where Whisper appears to be hallucinating text, "
-    "such as over music or applause after speech ends. Does not remove "
-    "filler words or repetitions.",
-)
-with st.expander("Advanced options", icon=":material/tune:"):
-    decode_independently = _labeled_toggle(
-        "Decode segments independently",
-        "When enabled, each 30-second window is transcribed without context "
-        "from prior windows. More robust on noisy or music-heavy audio.",
-    )
+    # The intent seam: language describes the input, the three toggles below shape
+    # the output. Uniform row spacing renders all four as one undifferentiated run.
+    st.space("small")
 
-    _field_label(
-        "Time range",
-        'Comma-separated start,end pairs in seconds (e.g., "30,90" for a '
-        'single clip, "0,60,120,180" for multiple clips). Leave blank to '
-        "transcribe the full file.",
+    translate = _labeled_toggle(
+        "Translate to English",
+        "Translates audio to English instead of transcribing in the source language.",
     )
-    time_range_input = st.text_input(
-        "Time range",
-        placeholder="e.g., 30,90 (leave blank for full file)",
-        label_visibility="collapsed",
-    ).strip()
-    time_range_error = _validate_time_range(time_range_input)
-    clip_timestamps = time_range_input or "0"
+    with _control_row():
+        st.markdown(
+            "Transcript format",
+            help="Plain text, or timestamped SRT subtitle cues — best for adding "
+            "subtitles to a video. The transcript stays editable either way, and "
+            "this also switches the Download button between .txt and .srt.",
+        )
+        # required=True on top of default= is what makes the return a `str` rather
+        # than `str | None`: without it, clicking the selected segment deselects it
+        # and a single-select segmented control returns None, which would silently
+        # read as "plain text" here and give the control a third, invisible state.
+        transcript_format = st.segmented_control(
+            "Transcript format",
+            TRANSCRIPT_FORMATS,
+            default=FORMAT_PLAIN_TEXT,
+            required=True,
+            label_visibility="collapsed",
+        )
+    include_subtitles = transcript_format == FORMAT_SUBTITLES
+    no_verbatim = _labeled_toggle(
+        "No verbatim",
+        "Skips silent stretches where Whisper appears to be hallucinating text, "
+        "such as over music or applause after speech ends. Does not remove "
+        "filler words or repetitions.",
+    )
+    # The second seam, matching the one above: input | output | advanced. With only
+    # the first one the card reads as two tiers rather than three.
+    st.space("small")
 
-    _field_label(
-        "Keyterms",
-        "Up to 50 keyterms to be boosted during transcription. "
-        "Boosted terms are more likely to appear in the output.",
-    )
-    keyterms = st.multiselect(
-        "Keyterms",
-        options=[],
-        accept_new_options=True,
-        max_selections=50,
-        placeholder="Add keyterms...",
-        label_visibility="collapsed",
-    )
+    with st.expander("Advanced options", icon=":material/tune:"):
+        decode_independently = _labeled_toggle(
+            "Decode segments independently",
+            "When enabled, each 30-second window is transcribed without context "
+            "from prior windows. More robust on noisy or music-heavy audio.",
+        )
+
+        # Inline at SELECT_WIDTH rather than stacked under a _field_label, so this
+        # row matches the toggle above it and the four rows in the card. The
+        # placeholder sheds "(leave blank for full file)" to fit — that sentence is
+        # not lost, the help tooltip already carries it. Keyterms below stays
+        # stacked because its chips genuinely need the full width.
+        with _control_row():
+            st.markdown(
+                "Time range",
+                help='Comma-separated start,end pairs in seconds (e.g., "30,90" for a '
+                'single clip, "0,60,120,180" for multiple clips). Leave blank to '
+                "transcribe the full file.",
+            )
+            time_range_input = st.text_input(
+                "Time range",
+                placeholder="e.g., 30,90",
+                width=SELECT_WIDTH,
+                label_visibility="collapsed",
+            ).strip()
+        time_range_error = _validate_time_range(time_range_input)
+        clip_timestamps = time_range_input or "0"
+
+        _field_label(
+            "Keyterms",
+            "Up to 50 keyterms to be boosted during transcription. "
+            "Boosted terms are more likely to appear in the output.",
+        )
+        keyterms = st.multiselect(
+            "Keyterms",
+            options=[],
+            accept_new_options=True,
+            max_selections=50,
+            placeholder="Add keyterms...",
+            label_visibility="collapsed",
+        )
     initial_prompt = ", ".join(keyterms) or None
 
 # Remote fetches run here, below every control, and write back into the slots
@@ -654,7 +764,14 @@ with st.expander("Advanced options", icon=":material/tune:"):
 # typed URL on every tab switch.
 youtube_audio: _RemoteAudio | None = None
 if youtube_tab.open and youtube_url and YOUTUBE_URL_RE.match(youtube_url):
-    with youtube_slot:
+    # `with youtube_slot, st.skeleton(...)`, not `youtube_slot.skeleton()`. The
+    # skeleton's context-manager form does not redirect bare st.* calls into
+    # itself -- they land in the *parent* container -- so entering youtube_slot
+    # first is what keeps the cache's download spinner, the st.audio preview and
+    # the two error alerts inside the tab. Calling youtube_slot.skeleton() alone
+    # would put the skeleton in the tab and strand everything else below the
+    # controls, which is the exact layout bug reserving the slot exists to avoid.
+    with youtube_slot, st.skeleton(height=AUDIO_PREVIEW_HEIGHT):
         try:
             data, filename, mime = _fetch_youtube_audio(youtube_url)
             youtube_audio = _RemoteAudio(filename, data)
@@ -667,9 +784,15 @@ if youtube_tab.open and youtube_url and YOUTUBE_URL_RE.match(youtube_url):
 
 url_audio: _RemoteAudio | None = None
 if url_tab.open and file_url and URL_RE.match(file_url):
-    with url_slot:
+    with url_slot, st.skeleton(height=AUDIO_PREVIEW_HEIGHT):  # Nested as above.
         if YOUTUBE_URL_RE.match(file_url):
-            st.info("This looks like a YouTube URL — use the YouTube tab.")
+            # Icon matches the YouTube tab's own, so the callout points at its
+            # destination. st.info has no default icon, same as st.error — see
+            # _error, which exists to keep that from being forgotten.
+            st.info(
+                "This looks like a YouTube URL — use the YouTube tab.",
+                icon=":material/smart_display:",
+            )
         else:
             try:
                 data, filename, mime = _fetch_url_audio(file_url)

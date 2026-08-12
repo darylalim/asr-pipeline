@@ -13,9 +13,12 @@ from streamlit_app import (
     AUDIO_FORMATS,
     DEFAULT_MEDIA_MIME,
     ERROR_ICON,
+    FORMAT_PLAIN_TEXT,
+    FORMAT_SUBTITLES,
     MAX_DOWNLOAD_BYTES,
     PAGE_CONFIG,
     SELECT_WIDTH,
+    TRANSCRIPT_FORMATS,
     VIDEO_FORMATS,
     _display_transcription,
     _error,
@@ -27,6 +30,7 @@ from streamlit_app import (
     _format_timestamp,
     _handle_transcription,
     _media_mime,
+    _plural,
     _RemoteAudio,
     _transcribe,
     _transcription_kwargs,
@@ -207,6 +211,12 @@ def mock_st():
 
 def test_asr_model_repo():
     assert ASR_MODEL_REPO == "mlx-community/whisper-large-v3-turbo"
+
+
+def test_transcript_formats():
+    # Order is display order in the segmented control, and index 0 is the default.
+    assert TRANSCRIPT_FORMATS == (FORMAT_PLAIN_TEXT, FORMAT_SUBTITLES)
+    assert TRANSCRIPT_FORMATS == ("Plain text", "Subtitles")
 
 
 def test_audio_formats():
@@ -558,6 +568,31 @@ def test_handle_transcription_escapes_filename_in_status_label(mock_transcribe, 
 
     status = mock_st.status.return_value.__enter__.return_value
     status.update.assert_any_call(label=r"Transcribing clip \[1\].mp3 (1/1)...")
+
+
+@pytest.mark.parametrize(
+    "count,opening,closing",
+    [
+        (1, "Transcribing 1 file...", "Transcribed 1/1 file"),
+        (2, "Transcribing 2 files...", "Transcribed 2/2 files"),
+    ],
+    ids=["single", "batch"],
+)
+@patch("streamlit_app._transcribe", return_value=MOCK_WHISPER_RESULT)
+def test_handle_transcription_pluralizes_the_status_labels(
+    mock_transcribe, mock_st, count, opening, closing
+):
+    # Both of these labels used to read "file(s)". Neither was asserted anywhere,
+    # which is why the parenthesised form survived -- and a single file, the case
+    # it gets wrong, is the common one.
+    _handle_transcription(
+        [_make_file(name=f"clip{i}.mp3") for i in range(count)],
+        **_handle_transcription_kwargs(),
+    )
+
+    mock_st.status.assert_called_once_with(opening, expanded=True)
+    status = mock_st.status.return_value.__enter__.return_value
+    status.update.assert_called_with(label=closing, state="complete")
 
 
 @pytest.mark.parametrize(
@@ -950,6 +985,15 @@ def test_format_language(code, expected):
 
 
 @pytest.mark.parametrize(
+    "count,expected",
+    [(1, "1 file"), (2, "2 files"), (0, "0 files")],
+    ids=["singular", "plural", "zero_is_plural"],
+)
+def test_plural(count, expected):
+    assert _plural(count, "file") == expected
+
+
+@pytest.mark.parametrize(
     "seconds,decimal_marker,expected",
     [
         (0.0, ".", "00:00:00.000"),
@@ -1336,3 +1380,42 @@ def test_active_remote_tab_enables_transcribe():
         _stub_urlopen(mock_urlopen, b"file bytes")
         at = _type_url("Audio/video file URL", "https://example.com/enable.mp3", URL_TAB)
     assert at.button[0].disabled is False
+
+
+def test_transcript_format_defaults_to_plain_text():
+    # This pins `default=` only. The companion `required=True` is deliberately NOT
+    # asserted here because AppTest cannot see it: per the docstring it stops a user
+    # from deselecting the chosen option in the browser ("clicking an already-selected
+    # option does nothing"), and AppTest's ButtonGroup.unselect() is a no-op for a
+    # single-select group whether or not required is set -- verified by deleting
+    # required=True and re-running, which changes nothing observable. So dropping
+    # required=True is a silent regression as far as this suite is concerned: it would
+    # let the widget return None, which reads as plain text through the
+    # `== FORMAT_SUBTITLES` comparison while looking like nothing is selected.
+    at = _run_app()
+    assert at.segmented_control[0].value == FORMAT_PLAIN_TEXT
+
+
+@pytest.mark.parametrize(
+    "choice,expected",
+    [(FORMAT_PLAIN_TEXT, False), (FORMAT_SUBTITLES, True)],
+    ids=["plain_text", "subtitles"],
+)
+def test_transcript_format_drives_include_subtitles(choice, expected):
+    # `include_subtitles = transcript_format == FORMAT_SUBTITLES` is a module-level
+    # comparison, so the only place the mapping is observable is what
+    # _handle_transcription stores. Drive the whole path: a URL source to enable
+    # Transcribe, a stubbed model, then read the recorded flag back. An inverted
+    # comparison would otherwise ship silently -- it changes no widget state, only
+    # the download's extension and the text area's contents.
+    with (
+        patch("urllib.request.urlopen") as mock_urlopen,
+        patch("mlx_whisper.transcribe", return_value=MOCK_WHISPER_RESULT),
+    ):
+        _stub_urlopen(mock_urlopen, b"file bytes")
+        at = _type_url("Audio/video file URL", "https://example.com/fmt.mp3", URL_TAB)
+        at.segmented_control[0].set_value(choice).run()
+        at.button[0].click().run()
+
+    assert not at.exception
+    assert at.session_state["transcription"][0]["include_subtitles"] is expected

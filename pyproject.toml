@@ -7,7 +7,7 @@ license = "MIT"
 license-files = ["LICENSE"]
 dependencies = [
     "mlx-whisper",
-    "streamlit>=1.58",
+    "streamlit>=1.59",
     "yt-dlp",
 ]
 
