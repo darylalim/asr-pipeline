@@ -1,3 +1,4 @@
+import math
 import re
 import tempfile
 from collections.abc import Sequence
@@ -347,6 +348,12 @@ def _validate_time_range(raw: str) -> str | None:
             value = float(token)
         except ValueError:
             return f"Invalid time range: {token!r} is not a number."
+        # float() happily accepts "nan", "inf" and any overflowing literal such
+        # as 1e400, and none of them trip the checks below: nan < 0 is False and
+        # every nan comparison is False, so a malformed range used to validate
+        # clean, enable Transcribe, and fail inside mlx_whisper instead.
+        if not math.isfinite(value):
+            return f"Invalid time range: {token!r} is not a finite number."
         if value < 0:
             return "Time range values must be non-negative."
         values.append(value)
@@ -357,6 +364,46 @@ def _validate_time_range(raw: str) -> str | None:
         if cur < prev:
             return "Time range values must be in increasing order."
     return None
+
+
+def _split_clips(clip_timestamps: str) -> list[str]:
+    """Split a `clip_timestamps` string into one `start,end` string per clip.
+
+    `"0,60,120,180"` → `["0,60", "120,180"]`. A trailing unpaired start keeps its
+    open end (`"0,60,120"` → `["0,60", "120"]`), which mlx_whisper reads as
+    running to the end of the file.
+
+    This exists because **mlx_whisper does not honour more than one clip.** Its
+    decode loop is `for seek_clip_start, seek_clip_end in seek_clips:` wrapping
+    `while seek < seek_clip_end:` — `seek_clip_start` is bound and never read,
+    and there is no `seek = seek_clip_start`, so `seek` carries over from the
+    previous clip and each later range simply continues from wherever the last
+    one stopped. Given `0,60,120,180` it decodes 0–180 straight through,
+    including the 60–120 the user excluded. (`clip_idx` at `transcribe.py:247` is
+    initialised and never incremented — vestigial from the same loop upstream.)
+    A single pair is unaffected, because `seek` is initialised to
+    `seek_clips[0][0]`, which is why `30,90` was always correct and only the
+    multi-clip tail was broken — and why the bug outlived a green test named
+    `multi_clip` that asserted only that the string was forwarded.
+    """
+    values = [t.strip() for t in clip_timestamps.split(",") if t.strip()]
+    return [",".join(values[i : i + 2]) for i in range(0, len(values), 2)] or ["0"]
+
+
+def _merge_transcriptions(results: list[dict]) -> dict:
+    """Concatenate per-clip results into the shape a single call returns.
+
+    Segment timestamps are already absolute — mlx_whisper derives them from
+    `seek`, which starts at the clip's own start frame — so segments concatenate
+    without adjustment and `_format_srt` needs no change. `language` comes from
+    the first clip: with `language=None` each clip auto-detects independently and
+    could in principle disagree, and one file gets one label.
+    """
+    return {
+        "text": "".join(r["text"] for r in results),
+        "segments": [segment for r in results for segment in r["segments"]],
+        "language": results[0]["language"],
+    }
 
 
 @st.cache_data(show_spinner=False, max_entries=20)
@@ -371,23 +418,37 @@ def _transcribe(
     condition_on_previous_text: bool = True,
     clip_timestamps: str = "0",
 ) -> dict:
+    # One mlx_whisper call per clip, because it decodes straight through the gaps
+    # between them — see _split_clips. A single clip (the "0" default, and every
+    # plain `start,end` pair) takes exactly one call and its result is returned
+    # untouched, so the common path is byte-identical to before. The accepted cost
+    # on the multi-clip path is that each call re-runs ffmpeg over the whole file;
+    # clips are typically two or three, and decoding the ranges the user actually
+    # asked for is worth more than one shared decode of ranges they excluded.
+    clips = _split_clips(clip_timestamps)
     with tempfile.NamedTemporaryFile(suffix=suffix) as tmp:
         tmp.write(audio_bytes)
         tmp.flush()
-        result = mlx_whisper.transcribe(
-            tmp.name,
-            path_or_hf_repo=ASR_MODEL_REPO,
-            language=language,
-            task=task,
-            initial_prompt=initial_prompt,
-            no_speech_threshold=0.6,
-            logprob_threshold=-1.0,
-            compression_ratio_threshold=2.4,
-            condition_on_previous_text=condition_on_previous_text,
-            word_timestamps=no_verbatim,
-            hallucination_silence_threshold=2.0 if no_verbatim else None,
-            clip_timestamps=clip_timestamps,
-        )
+        results = [
+            mlx_whisper.transcribe(
+                tmp.name,
+                path_or_hf_repo=ASR_MODEL_REPO,
+                language=language,
+                task=task,
+                initial_prompt=initial_prompt,
+                no_speech_threshold=0.6,
+                logprob_threshold=-1.0,
+                compression_ratio_threshold=2.4,
+                condition_on_previous_text=condition_on_previous_text,
+                word_timestamps=no_verbatim,
+                hallucination_silence_threshold=2.0 if no_verbatim else None,
+                clip_timestamps=clip,
+            )
+            for clip in clips
+        ]
+    result = results[0] if len(results) == 1 else _merge_transcriptions(results)
+    # Only the merged text is checked, so one silent clip inside a multi-clip
+    # range does not fail the whole transcription.
     if not result.get("text", "").strip():
         raise RuntimeError("Transcription produced no text")
     return result

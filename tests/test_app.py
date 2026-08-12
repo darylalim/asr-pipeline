@@ -32,6 +32,7 @@ from streamlit_app import (
     _media_mime,
     _plural,
     _RemoteAudio,
+    _split_clips,
     _transcribe,
     _transcription_kwargs,
     _validate_time_range,
@@ -458,14 +459,101 @@ def test_transcribe_defaults(mock_mlx):
         ({"no_verbatim": True}, {"word_timestamps": True, "hallucination_silence_threshold": 2.0}),
         ({"condition_on_previous_text": False}, {"condition_on_previous_text": False}),
         ({"clip_timestamps": "30,90"}, {"clip_timestamps": "30,90"}),
-        ({"clip_timestamps": "0,60,120,180"}, {"clip_timestamps": "0,60,120,180"}),
     ],
-    ids=["translate", "initial_prompt", "no_verbatim", "no_context", "single_clip", "multi_clip"],
+    ids=["translate", "initial_prompt", "no_verbatim", "no_context", "single_clip"],
 )
 def test_transcribe_forwards_kwargs(mock_mlx, call_kwargs, expected):
     _transcribe(b"audio", ".mp3", **call_kwargs)
     kwargs = mock_mlx.transcribe.call_args.kwargs
     assert {k: kwargs[k] for k in expected} == expected
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("0", ["0"]),
+        ("30,90", ["30,90"]),
+        ("0,60,120,180", ["0,60", "120,180"]),
+        ("0,60,120", ["0,60", "120"]),
+        (" 30 , 90 ", ["30,90"]),
+        ("", ["0"]),
+    ],
+    ids=["full_file", "single_pair", "two_pairs", "trailing_start", "whitespace", "blank"],
+)
+def test_split_clips(raw, expected):
+    assert _split_clips(raw) == expected
+
+
+def test_transcribe_splits_multi_clip_ranges(mock_mlx):
+    # mlx_whisper does not honour more than one clip: its decode loop binds
+    # seek_clip_start and never re-seeks to it, so "0,60,120,180" decoded 0-180
+    # straight through -- including the 60-120 the user excluded. One call per
+    # pair is the workaround. This case replaces a `multi_clip` parametrize entry
+    # that asserted only that the string was *forwarded*, which is exactly why a
+    # fully green suite shipped the wrong audio for the app's own README example.
+    _transcribe(b"audio", ".mp3", clip_timestamps="0,60,120,180")
+
+    calls = [c.kwargs["clip_timestamps"] for c in mock_mlx.transcribe.call_args_list]
+    assert calls == ["0,60", "120,180"]
+
+
+def test_transcribe_keeps_a_trailing_start_open_ended(mock_mlx):
+    # An odd trailing value is a start that runs to the end of the file -- that is
+    # mlx_whisper's own reading of clip_timestamps -- so it must stay unpaired
+    # rather than being padded into a degenerate range.
+    _transcribe(b"audio", ".mp3", clip_timestamps="0,60,120")
+
+    calls = [c.kwargs["clip_timestamps"] for c in mock_mlx.transcribe.call_args_list]
+    assert calls == ["0,60", "120"]
+
+
+def test_transcribe_single_clip_makes_one_call(mock_mlx):
+    # The common path stays exactly one model pass with the string unchanged.
+    _transcribe(b"audio", ".mp3", clip_timestamps="30,90")
+
+    assert mock_mlx.transcribe.call_count == 1
+    assert mock_mlx.transcribe.call_args.kwargs["clip_timestamps"] == "30,90"
+
+
+def test_transcribe_merges_multi_clip_results(mock_mlx):
+    # Segment timestamps are already absolute (mlx derives them from `seek`, which
+    # starts at the clip's own start frame), so segments concatenate with no
+    # adjustment and _format_srt is untouched. Language comes from the first clip.
+    mock_mlx.transcribe.side_effect = [
+        {
+            "text": " one",
+            "segments": [{"start": 0.0, "end": 1.0, "text": " one"}],
+            "language": "en",
+        },
+        {
+            "text": " two",
+            "segments": [{"start": 120.0, "end": 121.0, "text": " two"}],
+            "language": "fr",
+        },
+    ]
+
+    result = _transcribe(b"audio", ".mp3", clip_timestamps="0,60,120,180")
+
+    assert result["text"] == " one two"
+    assert [s["start"] for s in result["segments"]] == [0.0, 120.0]
+    assert result["language"] == "en"
+
+
+def test_transcribe_raises_only_when_every_clip_is_silent(mock_mlx):
+    # A silent clip inside a multi-clip range must not fail the whole file: the
+    # empty-text guard applies to the merged text, not to each pass.
+    silent = {"text": "   ", "segments": [], "language": "en"}
+    spoken = {
+        "text": " hello",
+        "segments": [{"start": 120.0, "end": 121.0, "text": " hello"}],
+        "language": "en",
+    }
+    mock_mlx.transcribe.side_effect = [silent, spoken]
+    assert _transcribe(b"audio", ".mp3", clip_timestamps="0,60,120,180")["text"].strip() == "hello"
+
+    mock_mlx.transcribe.side_effect = [silent, silent]
+    with pytest.raises(RuntimeError, match="no text"):
+        _transcribe(b"other audio", ".mp3", clip_timestamps="0,60,120,180")
 
 
 def test_transcribe_no_text_raises(mock_mlx):
@@ -1147,7 +1235,23 @@ def test_validate_time_range_valid(raw):
 
 @pytest.mark.parametrize(
     "raw",
-    ["abc", "30,abc", "-5,10", "90,30", "30,30", "30,", ",30", "60,90,0,30"],
+    [
+        "abc",
+        "30,abc",
+        "-5,10",
+        "90,30",
+        "30,30",
+        "30,",
+        ",30",
+        "60,90,0,30",
+        # float() accepts all four of these, and every comparison against a nan is
+        # False -- so they passed validation, enabled Transcribe, and failed
+        # inside mlx_whisper instead. "1e400" overflows to inf on the way in.
+        "nan",
+        "inf",
+        "0,inf",
+        "1e400",
+    ],
     ids=[
         "non_numeric",
         "non_numeric_pair",
@@ -1157,6 +1261,10 @@ def test_validate_time_range_valid(raw):
         "trailing_comma",
         "leading_comma",
         "out_of_order",
+        "nan",
+        "inf",
+        "inf_end",
+        "overflow_literal",
     ],
 )
 def test_validate_time_range_invalid(raw):
